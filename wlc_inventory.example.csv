@@ -1,0 +1,4 @@
+name,host,datacenter
+WLC-CORE-1,10.0.0.1,DC1
+WLC-CORE-2,10.0.0.2,DC1
+WLC-BRANCH-1,10.1.0.1,DC2
