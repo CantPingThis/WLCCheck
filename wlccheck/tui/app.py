@@ -16,6 +16,7 @@ from textual.command import Command, Provider
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
+from textual.css.query import NoMatches
 from textual.timer import Timer
 from textual.widgets import (
     Button,
@@ -119,10 +120,33 @@ class WLCCheckCommands(Provider):
 # Rich formatting helpers
 # ===========================================================================
 
+# Style shorthands — single source of truth for repeated style strings
+_S_GREEN  = "bold green"
+_S_RED    = "bold red"
+_S_YELLOW = "bold yellow"
+_S_CYAN   = "bold cyan"
+
+# Shared CSS path used by all modal screens
+_CSS = "styles.tcss"
+
+# Widget IDs referenced from multiple methods
+_WID_ERROR_BAR   = "#error-bar"
+_WID_PW_INPUT    = "#password-input"
+_WID_LABEL_INPUT = "#label-input"
+_WID_WLC_SEL     = "#wlc-selection"
+
+# Column header strings used in both on_mount table setup and CSV export
+_COL_PREV_POLL  = "PREV POLL"
+_COL_CHANGED_AT = "CHANGED AT"
+_COL_NOT_JOINED = "NOT JOINED"
+_COL_POLL_NUM   = "POLL #"
+_COL_PRE_STATE  = "PRE STATE"
+_COL_POST_STATE = "POST STATE"
+
 _STATE_STYLE: dict[str, tuple[str, str]] = {
-    "joined":      ("●", "bold green"),
-    "not_joined":  ("✕", "bold red"),
-    "downloading": ("⟳", "bold yellow"),
+    "joined":      ("●", _S_GREEN),
+    "not_joined":  ("✕", _S_RED),
+    "downloading": ("⟳", _S_YELLOW),
     "reset":       ("↺", "yellow"),
     "discovery":   ("⌕", "cyan"),
     "standby":     ("◌", "blue"),
@@ -130,27 +154,27 @@ _STATE_STYLE: dict[str, tuple[str, str]] = {
 }
 
 _CHANGE_FMT: dict[str, tuple[str, str]] = {
-    "lost":         ("▼", "bold red"),
-    "disappeared":  ("✕", "bold red"),
-    "degraded":     ("↓", "bold yellow"),
+    "lost":         ("▼", _S_RED),
+    "disappeared":  ("✕", _S_RED),
+    "degraded":     ("↓", _S_YELLOW),
     "state_change": ("~", "yellow"),
-    "tag_change":   ("⊘", "bold yellow"),
-    "recovered":    ("▲", "bold green"),
-    "new":          ("★", "bold cyan"),
-    "down":         ("▼", "bold red"),
-    "up":           ("▲", "bold green"),
-    "client_drop":  ("▼", "bold yellow"),
+    "tag_change":   ("⊘", _S_YELLOW),
+    "recovered":    ("▲", _S_GREEN),
+    "new":          ("★", _S_CYAN),
+    "down":         ("▼", _S_RED),
+    "up":           ("▲", _S_GREEN),
+    "client_drop":  ("▼", _S_YELLOW),
     "client_gain":  ("▲", "cyan"),
-    "removed":      ("✕", "bold red"),
-    "lost_ip":      ("✕", "bold red"),
-    "got_ip":       ("✓", "bold green"),
-    "new_no_ip":    ("⚠", "bold yellow"),
+    "removed":      ("✕", _S_RED),
+    "lost_ip":      ("✕", _S_RED),
+    "got_ip":       ("✓", _S_GREEN),
+    "new_no_ip":    ("⚠", _S_YELLOW),
 }
 
 _SEV_FMT: dict[str, tuple[str, str]] = {
-    "critical": ("⛔", "bold red"),
-    "warning":  ("⚠ ", "bold yellow"),
-    "info":     ("ℹ ", "bold cyan"),
+    "critical": ("⛔", _S_RED),
+    "warning":  ("⚠ ", _S_YELLOW),
+    "info":     ("ℹ ", _S_CYAN),
 }
 
 _FILTER_CYCLE = ("all", "warning", "critical")
@@ -175,7 +199,7 @@ def _live_ap_state_texts(
     bas_txt  = _fmt_state(baseline.state) if baseline else Text("—", style="dim")
     prev_txt = _fmt_state(prev.state)     if prev     else Text("—", style="dim")
     if is_missing:
-        cur_txt = Text("✕ Not Joined", style="bold red")
+        cur_txt = Text("✕ Not Joined", style=_S_RED)
         cur_txt.append("  [gone]", style="dim red")
     else:
         cur_txt = _fmt_state(ap.state)
@@ -247,6 +271,79 @@ def _fmt_state_or_dash(state: Optional[str]) -> Text:
 
 def _colored_count(n: int, color: str) -> Text:
     return Text(str(n), style=f"bold {color}" if n > 0 else "dim")
+
+
+def _apply_tags(records: "List[APRecord]", tags_map: dict, client: "WLCClient") -> None:
+    """Merge tag data from the ap-tags API into AP records (non-empty values win)."""
+    for r in records:
+        norm = client._norm_mac(r.wtp_mac)
+        if norm not in tags_map:
+            continue
+        p, s, rf = tags_map[norm]
+        if p:
+            r.policy_tag = p
+        if s:
+            r.site_tag = s
+        if rf:
+            r.rf_tag = rf
+
+
+def _collect_wlc_entry(
+    entry: "WLCEntry",
+    username: str,
+    password: str,
+    collect_clients: bool,
+    status_cb,
+) -> "WLCResult":
+    """Collect data from a single WLC. Designed to run inside a thread pool."""
+    prefix = f"\\[{entry.name}]"
+    try:
+        status_cb(f"{prefix} Connecting to [bold]{entry.host}[/bold]…")
+        client   = WLCClient(entry.host, username, password)
+        hostname = client.get_hostname()
+        if hostname:
+            status_cb(f"{prefix} [green]✓[/green] {hostname}")
+
+        records = client.get_ap_data(status_cb=lambda m: status_cb(f"{prefix} {m}"))
+        for r in records:
+            r.wlc_name = entry.name
+
+        tags_map = client.get_ap_tags(status_cb=lambda m: status_cb(f"{prefix} {m}"))
+        _apply_tags(records, tags_map, client)
+
+        wlans = client.get_wlans(status_cb=lambda m: status_cb(f"{prefix} {m}"))
+        for w in wlans:
+            w.wlc_name = entry.name
+
+        clients: List[ClientRecord] = []
+        if collect_clients:
+            clients = client.get_clients(status_cb=lambda m: status_cb(f"{prefix} {m}"))
+            for c in clients:
+                c.wlc_name = entry.name
+
+        stats        = APStats.from_records(records)
+        client_stats = ClientStats.from_records(clients)
+        status_cb(
+            f"{prefix} [green]✓[/green] Done — "
+            f"{stats.total} APs  "
+            f"([green]{stats.joined}[/green] joined)"
+            + (f"  {len(clients)} clients" if collect_clients else "")
+        )
+        return WLCResult(
+            wlc_name=entry.name, wlc_host=entry.host,
+            wlc_hostname=hostname, records=records,
+            stats=stats, ok=True,
+            wlans=wlans, clients=clients,
+            client_stats=client_stats,
+        )
+    except Exception as exc:
+        tag = "Auth error" if isinstance(exc, WLCAuthError) else "Error"
+        status_cb(f"{prefix} [bold red]✕ {tag}:[/bold red] {exc}")
+        return WLCResult(
+            wlc_name=entry.name, wlc_host=entry.host,
+            wlc_hostname=None, records=[], stats=APStats(),
+            ok=False, error=str(exc),
+        )
 
 
 def _fmt_tags(tags: tuple[str, str, str]) -> str:
@@ -530,7 +627,7 @@ class RunPickerModal(ModalScreen):
         table.add_columns("LABEL", "WLCs", "APs", "JOINED", "CLIENTS", "FAILED", "COLLECTED")
         for r in self._runs:
             failed = len(r.failed_wlcs)
-            fail_txt = Text(str(failed), style="bold red") if failed else Text("0", style="dim")
+            fail_txt = Text(str(failed), style=_S_RED) if failed else Text("0", style="dim")
             client_txt = Text("✓", style="bold cyan") if r.has_clients else Text("—", style="dim")
             table.add_row(
                 r.display_label,
@@ -841,56 +938,33 @@ class MainScreen(Screen):
 
     def action_live_export(self) -> None:
         """Export all three live-monitor tables to timestamped CSV files."""
-        import csv, pathlib
-
         ts      = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         outdir  = pathlib.Path.cwd()
         focused = self._live_focused_wlc
         scope   = focused.replace(" ", "_") if focused else "all"
 
-        def _state_str(state: Optional[str]) -> str:
-            return state.replace("_", " ").title() if state else "—"
-
         # ── AP Status ───────────────────────────────────────────────────────
-        ap_path = outdir / f"wlccheck_live_ap_{scope}_{ts}.csv"
-        baseline_by_mac = {r.wtp_mac: r
-                           for wlc, recs in self._live_baseline.items()
-                           if focused is None or wlc == focused
-                           for r in recs}
-        prev_by_mac     = {r.wtp_mac: r
-                           for wlc, recs in self._live_prev.items()
-                           if focused is None or wlc == focused
-                           for r in recs}
-        current_by_mac  = {r.wtp_mac: r
-                           for wlc, recs in self._live_current.items()
-                           if focused is None or wlc == focused
-                           for r in recs}
-        all_aps = list(current_by_mac.values())
-        for mac, rec in self._live_known.items():
-            if mac not in current_by_mac and (focused is None or rec.wlc_name == focused):
-                all_aps.append(rec)
-        all_aps.sort(key=lambda r: (r.wlc_name.lower(), r.name.lower()))
-
-        since_by_mac = {evt.wtp_mac: evt.timestamp.strftime("%H:%M:%S")
-                        for evt in self._live_events
-                        if focused is None or evt.wlc_name == focused}
+        ap_path         = outdir / f"wlccheck_live_ap_{scope}_{ts}.csv"
+        baseline_by_mac = self._live_records_by_mac(self._live_baseline, focused)
+        prev_by_mac     = self._live_records_by_mac(self._live_prev,     focused)
+        current_by_mac  = self._live_records_by_mac(self._live_current,  focused)
 
         with ap_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["NAME", "MAC", "WLC", "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT"])
-            for ap in all_aps:
+            for ap in self._live_ap_union(current_by_mac, focused):
                 is_missing = ap.wtp_mac not in current_by_mac
                 baseline   = baseline_by_mac.get(ap.wtp_mac)
                 prev       = prev_by_mac.get(ap.wtp_mac)
-                cur_state  = "Not Joined (gone)" if is_missing else _state_str(ap.state)
+                cur_state  = "Not Joined (gone)" if is_missing else _state_label(ap.state)
                 w.writerow([
                     ap.name,
                     ap.wtp_mac or "—",
                     ap.wlc_name or "—",
-                    _state_str(baseline.state) if baseline else "—",
-                    _state_str(prev.state)     if prev     else "—",
+                    _state_label(baseline.state) if baseline else "—",
+                    _state_label(prev.state)     if prev     else "—",
                     cur_state,
-                    since_by_mac.get(ap.wtp_mac, "—"),
+                    self._live_since_by_mac.get(ap.wtp_mac, "—"),
                 ])
 
         # ── Event Log ───────────────────────────────────────────────────────
@@ -907,8 +981,8 @@ class MainScreen(Screen):
                     evt.wlc_name,
                     evt.ap_name,
                     evt.wtp_mac,
-                    _state_str(evt.from_state) if evt.from_state != "—" else "—",
-                    _state_str(evt.to_state),
+                    _state_label(evt.from_state),
+                    _state_label(evt.to_state),
                 ])
 
         # ── History ─────────────────────────────────────────────────────────
@@ -1079,101 +1153,21 @@ class MainScreen(Screen):
         collect_clients: bool,
     ) -> None:
         app: WLCCheckApp = self.app  # type: ignore[assignment]
-        username = app.username
-        password = app.password
 
         def status(msg: str) -> None:
             self.post_message(StatusUpdate(msg))
 
-        def collect_one(entry: WLCEntry) -> WLCResult:
-            prefix = f"\\[{entry.name}]"
-            try:
-                status(f"{prefix} Connecting to [bold]{entry.host}[/bold]…")
-                client = WLCClient(entry.host, username, password)
-
-                hostname = client.get_hostname()
-                if hostname:
-                    status(f"{prefix} [green]✓[/green] {hostname}")
-
-                # AP data
-                records = client.get_ap_data(
-                    status_cb=lambda m: status(f"{prefix} {m}")
-                )
-                for r in records:
-                    r.wlc_name = entry.name
-
-                # Tags (baseline)
-                tags_map = client.get_ap_tags(
-                    status_cb=lambda m: status(f"{prefix} {m}")
-                )
-                for r in records:
-                    # tags_map keyed by normalised MAC; only overwrite if the
-                    # separate ap-tag API returned data (non-empty values).
-                    norm = client._norm_mac(r.wtp_mac)
-                    if norm in tags_map:
-                        p, s, rf = tags_map[norm]
-                        if p:
-                            r.policy_tag = p
-                        if s:
-                            r.site_tag = s
-                        if rf:
-                            r.rf_tag = rf
-
-                # WLANs (baseline)
-                wlans = client.get_wlans(
-                    status_cb=lambda m: status(f"{prefix} {m}")
-                )
-                for w in wlans:
-                    w.wlc_name = entry.name
-
-                # Clients (optional)
-                clients: List[ClientRecord] = []
-                if collect_clients:
-                    clients = client.get_clients(
-                        status_cb=lambda m: status(f"{prefix} {m}")
-                    )
-                    for c in clients:
-                        c.wlc_name = entry.name
-
-                from ..core.models import APStats, ClientStats
-                stats        = APStats.from_records(records)
-                client_stats = ClientStats.from_records(clients)
-
-                status(
-                    f"{prefix} [green]✓[/green] Done — "
-                    f"{stats.total} APs  "
-                    f"([green]{stats.joined}[/green] joined)"
-                    + (f"  {len(clients)} clients" if collect_clients else "")
-                )
-                return WLCResult(
-                    wlc_name=entry.name, wlc_host=entry.host,
-                    wlc_hostname=hostname, records=records,
-                    stats=stats, ok=True,
-                    wlans=wlans, clients=clients,
-                    client_stats=client_stats,
-                )
-
-            except WLCAuthError as exc:
-                status(f"{prefix} [bold red]✕ Auth error:[/bold red] {exc}")
-                return WLCResult(
-                    wlc_name=entry.name, wlc_host=entry.host,
-                    wlc_hostname=None, records=[], stats=APStats(),
-                    ok=False, error=str(exc),
-                )
-            except Exception as exc:
-                status(f"{prefix} [bold red]✕ Error:[/bold red] {exc}")
-                return WLCResult(
-                    wlc_name=entry.name, wlc_host=entry.host,
-                    wlc_hostname=None, records=[], stats=APStats(),
-                    ok=False, error=str(exc),
-                )
-
+        username = app.username
+        password = app.password
         max_workers = min(len(entries), 8)
         status(f"Collecting from {len(entries)} WLC(s) — {max_workers} parallel threads…")
 
         results: List[WLCResult] = []
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(collect_one, e): e for e in entries}
+            futures = {
+                pool.submit(_collect_wlc_entry, e, username, password, collect_clients, status): e
+                for e in entries
+            }
             for future in as_completed(futures):
                 results.append(future.result())
 
@@ -1267,8 +1261,8 @@ class MainScreen(Screen):
         wlan_table = self.query_one("#wlan-table", DataTable)
         wlan_table.clear()
         for w in sorted(run.all_wlans, key=lambda x: (x.wlc_name.lower(), x.wlan_id)):
-            state_txt = Text("● Up", style="bold green") if w.state == "up" \
-                else Text("✕ Down", style="bold red") if w.state == "down" \
+            state_txt = Text("● Up", style=_S_GREEN) if w.state == "up" \
+                else Text("✕ Down", style=_S_RED) if w.state == "down" \
                 else Text(w.state, style="dim")
             wlan_table.add_row(
                 w.wlc_name     or "—",
@@ -1285,8 +1279,8 @@ class MainScreen(Screen):
         if run.has_clients:
             for c in sorted(run.all_clients, key=lambda x: x.mac):
                 ip_txt = Text(c.ipv4 or c.ipv6 or "—",
-                              style="bold red" if not c.has_ip else "default")
-                state_txt = Text(c.state, style="bold green" if c.state == "run" else "yellow")
+                              style=_S_RED if not c.has_ip else "default")
+                state_txt = Text(c.state, style=_S_GREEN if c.state == "run" else "yellow")
                 client_table.add_row(
                     c.wlc_name or "—",
                     c.mac,
@@ -1302,7 +1296,7 @@ class MainScreen(Screen):
         wt = self.query_one("#wlc-status-table", DataTable)
         wt.clear()
         for r in run.wlc_results:
-            st = Text("● OK", style="bold green") if r.ok else Text("✕ Failed", style="bold red")
+            st = Text("● OK", style=_S_GREEN) if r.ok else Text("✕ Failed", style=_S_RED)
             wt.add_row(
                 r.wlc_name, r.wlc_host, st,
                 str(r.stats.total), str(r.stats.joined),
@@ -1454,8 +1448,8 @@ class MainScreen(Screen):
                 if row_key in changed_keys:
                     continue
                 state_txt = (
-                    Text("● Up",   style="bold green") if w.state == "up"
-                    else Text("✕ Down", style="bold red")
+                    Text("● Up",   style=_S_GREEN) if w.state == "up"
+                    else Text("✕ Down", style=_S_RED)
                 )
                 table.add_row(
                     w.wlc_name     or "—",
@@ -1511,8 +1505,7 @@ class MainScreen(Screen):
         # Build baseline lookup from pre-check run (if available)
         self._live_baseline = {}
         if self._baseline_run:
-            from ..core.storage import SnapshotDB as _DB
-            for rec in _DB().load_records(self._baseline_run.uuid):
+            for rec in SnapshotDB().load_records(self._baseline_run.uuid):
                 self._live_baseline.setdefault(rec.wlc_name, []).append(rec)
 
         # Ordered WLC list (only successful results)
@@ -1653,13 +1646,13 @@ class MainScreen(Screen):
             d = cur.joined - bas.joined
             delta_txt = Text(
                 f"{'▲' if d > 0 else ('▼' if d < 0 else '=')} {d:+d} joined",
-                style="bold green" if d >= 0 else "bold red",
+                style=_S_GREEN if d >= 0 else _S_RED,
             )
         elif prv:
             d = cur.joined - prv.joined
             delta_txt = Text(
                 f"{'▲' if d > 0 else ('▼' if d < 0 else '=')} {d:+d} joined",
-                style="bold green" if d >= 0 else "bold red",
+                style=_S_GREEN if d >= 0 else _S_RED,
             )
         else:
             delta_txt = Text("—", style="dim")
@@ -1732,7 +1725,7 @@ class MainScreen(Screen):
         for p in polls:
             nj_txt = Text(
                 str(p.not_joined),
-                style="bold red" if p.not_joined > 0 else "dim",
+                style=_S_RED if p.not_joined > 0 else "dim",
             )
             table.add_row(
                 str(p.poll_num),
@@ -1802,9 +1795,19 @@ class MainScreen(Screen):
         focused: Optional[str],
     ) -> List[APRecord]:
         aps = list(current_by_mac.values())
+        seen = set(current_by_mac.keys())
+
+        # APs that disappeared during monitoring (seen in a previous poll)
         for mac, rec in self._live_known.items():
-            if mac not in current_by_mac and (focused is None or rec.wlc_name == focused):
+            if mac not in seen and (focused is None or rec.wlc_name == focused):
                 aps.append(rec)
+                seen.add(mac)
+
+        # APs that were already down before the first poll (in baseline but never polled)
+        for mac, rec in self._live_records_by_mac(self._live_baseline, focused).items():
+            if mac not in seen:
+                aps.append(rec)
+
         aps.sort(key=lambda r: (r.wlc_name.lower(), r.name.lower()))
         return aps
 
