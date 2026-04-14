@@ -51,6 +51,7 @@ htmlcov/
 wlc_inventory.csv
 wlccheck.db
 *.db
+wlccheck_live_*.csv
 
 # Environment credentials
 .env

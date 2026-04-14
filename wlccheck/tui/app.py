@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import csv
 import datetime as _dt
 import os
+import pathlib
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 from rich.text import Text
 from textual import on, work
@@ -158,11 +161,67 @@ _FILTER_LABEL = {
 }
 
 
+def _state_label(state: Optional[str]) -> str:
+    """Plain-string state label, safe for CSV and Rich-free contexts."""
+    return state.replace("_", " ").title() if state else "—"
+
+
+def _live_ap_state_texts(
+    ap: "APRecord",
+    is_missing: bool,
+    baseline: "Optional[APRecord]",
+    prev: "Optional[APRecord]",
+) -> "tuple[Text, Text, Text]":
+    bas_txt  = _fmt_state(baseline.state) if baseline else Text("—", style="dim")
+    prev_txt = _fmt_state(prev.state)     if prev     else Text("—", style="dim")
+    if is_missing:
+        cur_txt = Text("✕ Not Joined", style="bold red")
+        cur_txt.append("  [gone]", style="dim red")
+    else:
+        cur_txt = _fmt_state(ap.state)
+        if baseline and baseline.state != ap.state:
+            cur_txt.stylize("bold")
+    return bas_txt, prev_txt, cur_txt
+
+
+def _live_ap_changed(
+    is_missing: bool,
+    moved: bool,
+    baseline: "Optional[APRecord]",
+    prev: "Optional[APRecord]",
+    eff_state: str,
+) -> bool:
+    return (
+        moved
+        or is_missing
+        or (baseline is not None and baseline.state != eff_state)
+        or (prev is not None and prev.state != eff_state)
+    )
+
+
+def _live_ap_mobility_texts(
+    bl_wlc: "Optional[str]",
+    cur_wlc: "Optional[str]",
+    moved: bool,
+) -> "tuple[Text, Text, Text]":
+    if moved:
+        return (
+            Text("→",             style="bold yellow"),
+            Text(bl_wlc,          style="dim"),         # type: ignore[arg-type]
+            Text(cur_wlc,         style="bold yellow"),  # type: ignore[arg-type]
+        )
+    return (
+        Text("—",             style="dim"),
+        Text(bl_wlc  or "—",  style="dim"),
+        Text(cur_wlc or "—",  style="dim"),
+    )
+
+
 def _fmt_state(state: str) -> Text:
     icon, style = _STATE_STYLE.get(state, ("?", "dim"))
     t = Text()
     t.append(f"{icon} ", style=style)
-    t.append(state.replace("_", " ").title(), style=style)
+    t.append(_state_label(state), style=style)
     return t
 
 
@@ -510,7 +569,9 @@ class MainScreen(Screen):
         Binding("o",         "toggle_unchanged",  "Only Changes"),
         Binding("space",     "live_pause",        "Pause/Resume", show=False),
         Binding("r",         "live_refresh",      "Force Poll",   show=False),
-        Binding("escape",    "live_exit",         "Back",         show=False),
+        Binding("x",         "live_export",          "Export CSV",    show=False),
+        Binding("m",         "live_toggle_mobility", "WLC Mobility",  show=False),
+        Binding("escape",    "live_exit",            "Back",          show=False),
         Binding("q",         "quit",              "Quit"),
     ]
 
@@ -526,13 +587,14 @@ class MainScreen(Screen):
     _pending_live_interval:  int                      = 0
 
     # live monitor state
-    _live_mode:        bool                      = False
-    _live_interval:    int                       = 60
-    _live_paused:      bool                      = False
-    _live_poll_num:    int                       = 0
-    _live_countdown:   int                       = 0
-    _live_only_changes: bool                     = False
-    _live_focused_wlc: Optional[str]             = None
+    _live_mode:         bool         = False
+    _live_interval:     int          = 60
+    _live_paused:       bool         = False
+    _live_poll_num:     int          = 0
+    _live_countdown:    int          = 0
+    _live_only_changes: bool         = False
+    _live_focused_wlc:  Optional[str] = None
+    _live_show_mobility: bool        = False
 
     # ------------------------------------------------------------------ compose
 
@@ -666,15 +728,17 @@ class MainScreen(Screen):
 
     def on_mount(self) -> None:
         # Instance-level live state (dicts/lists must not be class vars)
-        self._live_polls:    List[LivePollRecord]          = []
-        self._live_events:   List[APStateEvent]            = []
-        self._live_current:  Dict[str, List[APRecord]]     = {}
-        self._live_prev:     Dict[str, List[APRecord]]     = {}
-        self._live_baseline: Dict[str, List[APRecord]]     = {}
-        self._live_known:    Dict[str, APRecord]           = {}  # mac → last seen record
-        self._live_wlc_list: List[str]                     = []
-        self._live_entries:  List[WLCEntry]                = []
-        self._live_timer:    Optional[Timer]               = None
+        self._live_polls:           Deque[LivePollRecord]      = deque(maxlen=2000)
+        self._live_events:          Deque[APStateEvent]        = deque(maxlen=1000)
+        self._live_current:         Dict[str, List[APRecord]]  = {}
+        self._live_prev:            Dict[str, List[APRecord]]  = {}
+        self._live_baseline:        Dict[str, List[APRecord]]  = {}
+        self._live_known:           Dict[str, APRecord]        = {}
+        self._live_since_by_mac:    Dict[str, str]             = {}
+        self._live_ap_cols_mobility: Optional[bool]            = None  # sentinel
+        self._live_wlc_list:        List[str]                  = []
+        self._live_entries:         List[WLCEntry]             = []
+        self._live_timer:           Optional[Timer]            = None
 
         self.query_one("#ap-table", DataTable).add_columns(
             "WLC", "NAME", "STATE", "IP ADDRESS", "POLICY TAG", "SITE TAG", "RF TAG"
@@ -699,7 +763,7 @@ class MainScreen(Screen):
             "PRE STATE", "POST STATE", "CHANGE", "SEVERITY"
         )
         self.query_one("#live-ap-table", DataTable).add_columns(
-            "NAME", "WLC", "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT"
+            "NAME", "MAC", "WLC", "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT"
         )
         self.query_one("#live-event-table", DataTable).add_columns(
             "TIME", "POLL #", "WLC", "AP NAME", "FROM", "TO"
@@ -716,7 +780,7 @@ class MainScreen(Screen):
         "loading":   "Collection in progress…",
         "dashboard": "\\[c] New Snapshot  \\[p] Post-Check  \\[Ctrl+P] Commands  \\[q] Quit",
         "diff":      "\\[o] Toggle All/Changes  \\[f] Severity Filter  \\[c] New Snapshot  \\[p] Post-Check  \\[Ctrl+P] Commands  \\[q] Quit",
-        "live":      "\\[Space] Pause/Resume  \\[r] Force Poll  \\[0] All WLCs  \\[1-9] Focus WLC  \\[o] All/Changed  \\[Esc] Back  \\[q] Quit",
+        "live":      "\\[Space] Pause/Resume  \\[r] Force Poll  \\[0] All WLCs  \\[1-9] Focus WLC  \\[o] All/Changed  \\[m] WLC Mobility  \\[x] Export CSV  \\[Esc] Back  \\[q] Quit",
     }
 
     def _show_view(self, view: str) -> None:
@@ -771,6 +835,106 @@ class MainScreen(Screen):
         if not self._live_paused:
             self._live_countdown = 0   # fires on next 1-s tick
 
+    def action_live_toggle_mobility(self) -> None:
+        self._live_show_mobility = not self._live_show_mobility
+        self._refresh_live_ap_table()
+
+    def action_live_export(self) -> None:
+        """Export all three live-monitor tables to timestamped CSV files."""
+        import csv, pathlib
+
+        ts      = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        outdir  = pathlib.Path.cwd()
+        focused = self._live_focused_wlc
+        scope   = focused.replace(" ", "_") if focused else "all"
+
+        def _state_str(state: Optional[str]) -> str:
+            return state.replace("_", " ").title() if state else "—"
+
+        # ── AP Status ───────────────────────────────────────────────────────
+        ap_path = outdir / f"wlccheck_live_ap_{scope}_{ts}.csv"
+        baseline_by_mac = {r.wtp_mac: r
+                           for wlc, recs in self._live_baseline.items()
+                           if focused is None or wlc == focused
+                           for r in recs}
+        prev_by_mac     = {r.wtp_mac: r
+                           for wlc, recs in self._live_prev.items()
+                           if focused is None or wlc == focused
+                           for r in recs}
+        current_by_mac  = {r.wtp_mac: r
+                           for wlc, recs in self._live_current.items()
+                           if focused is None or wlc == focused
+                           for r in recs}
+        all_aps = list(current_by_mac.values())
+        for mac, rec in self._live_known.items():
+            if mac not in current_by_mac and (focused is None or rec.wlc_name == focused):
+                all_aps.append(rec)
+        all_aps.sort(key=lambda r: (r.wlc_name.lower(), r.name.lower()))
+
+        since_by_mac = {evt.wtp_mac: evt.timestamp.strftime("%H:%M:%S")
+                        for evt in self._live_events
+                        if focused is None or evt.wlc_name == focused}
+
+        with ap_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["NAME", "MAC", "WLC", "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT"])
+            for ap in all_aps:
+                is_missing = ap.wtp_mac not in current_by_mac
+                baseline   = baseline_by_mac.get(ap.wtp_mac)
+                prev       = prev_by_mac.get(ap.wtp_mac)
+                cur_state  = "Not Joined (gone)" if is_missing else _state_str(ap.state)
+                w.writerow([
+                    ap.name,
+                    ap.wtp_mac or "—",
+                    ap.wlc_name or "—",
+                    _state_str(baseline.state) if baseline else "—",
+                    _state_str(prev.state)     if prev     else "—",
+                    cur_state,
+                    since_by_mac.get(ap.wtp_mac, "—"),
+                ])
+
+        # ── Event Log ───────────────────────────────────────────────────────
+        ev_path = outdir / f"wlccheck_live_events_{scope}_{ts}.csv"
+        events  = [e for e in self._live_events
+                   if focused is None or e.wlc_name == focused]
+        with ev_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["TIME", "POLL #", "WLC", "AP NAME", "MAC", "FROM", "TO"])
+            for evt in events:
+                w.writerow([
+                    evt.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    evt.poll_num,
+                    evt.wlc_name,
+                    evt.ap_name,
+                    evt.wtp_mac,
+                    _state_str(evt.from_state) if evt.from_state != "—" else "—",
+                    _state_str(evt.to_state),
+                ])
+
+        # ── History ─────────────────────────────────────────────────────────
+        hist_path = outdir / f"wlccheck_live_history_{scope}_{ts}.csv"
+        polls     = [p for p in self._live_polls
+                     if focused is None or p.wlc_name == focused]
+        with hist_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["POLL #", "TIME", "WLC", "TOTAL", "JOINED", "NOT JOINED", "OTHER"])
+            for p in polls:
+                w.writerow([
+                    p.poll_num,
+                    p.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    p.wlc_name,
+                    p.total,
+                    p.joined,
+                    p.not_joined,
+                    p.other,
+                ])
+
+        self._show_error(
+            f"Exported → {ap_path.name}  ·  {ev_path.name}  ·  {hist_path.name}"
+        )
+        # Briefly show confirmation in the error bar, then clear after 4 s
+        self.set_timer(4.0, self._hide_error)
+
     def action_live_exit(self) -> None:
         self._live_mode = False
         if self._live_timer is not None:
@@ -784,7 +948,8 @@ class MainScreen(Screen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action in ("filter_diff", "toggle_unchanged"):
             return self._current_diff is not None or self._live_mode
-        if action in ("live_pause", "live_refresh", "live_exit"):
+        if action in ("live_pause", "live_refresh", "live_export",
+                      "live_toggle_mobility", "live_exit"):
             return self._live_mode
         return True
 
@@ -1327,18 +1492,21 @@ class MainScreen(Screen):
 
     def _enter_live_mode(self, run: Run) -> None:
         """Initialise and start the live AP monitor."""
-        self._live_mode         = True
-        self._live_interval     = self._pending_live_interval or 60
-        self._live_paused       = False
-        self._live_poll_num     = 0
-        self._live_countdown    = 0   # triggers an immediate first poll on first tick
-        self._live_only_changes = False
-        self._live_focused_wlc  = None
-        self._live_polls        = []
-        self._live_events       = []
-        self._live_current      = {}
-        self._live_prev         = {}
-        self._live_known        = {}
+        self._live_mode          = True
+        self._live_interval      = self._pending_live_interval or 60
+        self._live_paused        = False
+        self._live_poll_num      = 0
+        self._live_countdown     = 0   # triggers an immediate first poll on first tick
+        self._live_only_changes  = False
+        self._live_show_mobility = False
+        self._live_focused_wlc   = None
+        self._live_polls           = deque(maxlen=2000)
+        self._live_events          = deque(maxlen=1000)
+        self._live_current         = {}
+        self._live_prev            = {}
+        self._live_known           = {}
+        self._live_since_by_mac    = {}
+        self._live_ap_cols_mobility = None
 
         # Build baseline lookup from pre-check run (if available)
         self._live_baseline = {}
@@ -1418,30 +1586,27 @@ class MainScreen(Screen):
             for rec in records:
                 prev = prev_by_mac.get(rec.wtp_mac)
                 if prev and prev.state != rec.state:
-                    self._live_events.append(APStateEvent(
-                        timestamp=now,
-                        poll_num=event.poll_num,
-                        wlc_name=wlc_name,
-                        ap_name=rec.name,
+                    evt = APStateEvent(
+                        timestamp=now, poll_num=event.poll_num,
+                        wlc_name=wlc_name, ap_name=rec.name,
                         wtp_mac=rec.wtp_mac,
-                        from_state=prev.state,
-                        to_state=rec.state,
-                    ))
-                # Keep known map up to date
+                        from_state=prev.state, to_state=rec.state,
+                    )
+                    self._live_events.append(evt)
+                    self._live_since_by_mac[rec.wtp_mac] = now.strftime("%H:%M:%S")
                 self._live_known[rec.wtp_mac] = rec
 
             # Detect APs that were in the previous poll but are now missing
             for mac, prev_rec in prev_by_mac.items():
                 if mac not in current_macs:
-                    self._live_events.append(APStateEvent(
-                        timestamp=now,
-                        poll_num=event.poll_num,
-                        wlc_name=wlc_name,
-                        ap_name=prev_rec.name,
+                    evt = APStateEvent(
+                        timestamp=now, poll_num=event.poll_num,
+                        wlc_name=wlc_name, ap_name=prev_rec.name,
                         wtp_mac=mac,
-                        from_state=prev_rec.state,
-                        to_state="not_joined",
-                    ))
+                        from_state=prev_rec.state, to_state="not_joined",
+                    )
+                    self._live_events.append(evt)
+                    self._live_since_by_mac[mac] = now.strftime("%H:%M:%S")
 
             stats = APStats.from_records(records)
             self._live_polls.append(LivePollRecord(
@@ -1515,74 +1680,30 @@ class MainScreen(Screen):
             pass
 
     def _refresh_live_ap_table(self) -> None:
-        table = self.query_one("#live-ap-table", DataTable)
-        table.clear()
+        table   = self.query_one("#live-ap-table", DataTable)
         focused = self._live_focused_wlc
 
-        def _by_mac(d: Dict[str, List[APRecord]]) -> Dict[str, APRecord]:
-            out: Dict[str, APRecord] = {}
-            for wlc, recs in d.items():
-                if focused is None or wlc == focused:
-                    for r in recs:
-                        out[r.wtp_mac] = r
-            return out
-
-        baseline_map = _by_mac(self._live_baseline)
-        prev_map     = _by_mac(self._live_prev)
-
-        # Build current-poll MAC set for quick lookup
-        current_by_mac: Dict[str, APRecord] = {}
-        for wlc, recs in self._live_current.items():
-            if focused is None or wlc == focused:
-                for r in recs:
-                    current_by_mac[r.wtp_mac] = r
-
-        # Union: APs seen now + APs ever seen but now missing
-        all_aps: List[APRecord] = list(current_by_mac.values())
-        for mac, known_rec in self._live_known.items():
-            if mac not in current_by_mac:
-                if focused is None or known_rec.wlc_name == focused:
-                    all_aps.append(known_rec)
-        all_aps.sort(key=lambda r: (r.wlc_name.lower(), r.name.lower()))
-
-        since_by_mac: Dict[str, str] = {}
-        for evt in self._live_events:
-            if focused is None or evt.wlc_name == focused:
-                since_by_mac[evt.wtp_mac] = evt.timestamp.strftime("%H:%M:%S")
-
-        for ap in all_aps:
-            is_missing = ap.wtp_mac not in current_by_mac
-            baseline   = baseline_map.get(ap.wtp_mac)
-            prev       = prev_map.get(ap.wtp_mac)
-
-            # Effective current state: not_joined if AP disappeared from poll
-            eff_state = "not_joined" if is_missing else ap.state
-
-            changed = (baseline and baseline.state != eff_state) or \
-                      (prev and prev.state != eff_state) or is_missing
-            if self._live_only_changes and not changed:
-                continue
-
-            bas_txt  = _fmt_state(baseline.state) if baseline else Text("—", style="dim")
-            prev_txt = _fmt_state(prev.state)     if prev     else Text("—", style="dim")
-
-            if is_missing:
-                cur_txt = Text("✕ Not Joined", style="bold red")
-                cur_txt.append("  [gone]", style="dim red")
+        # Rebuild columns only when mobility mode actually changes
+        if self._live_show_mobility != self._live_ap_cols_mobility:
+            table.clear(columns=True)
+            if self._live_show_mobility:
+                table.add_columns(
+                    "NAME", "MAC", "BL WLC", "CUR WLC", "MOVED",
+                    "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT",
+                )
             else:
-                cur_txt = _fmt_state(ap.state)
-                if baseline and baseline.state != ap.state:
-                    cur_txt.stylize("bold")
+                table.add_columns(
+                    "NAME", "MAC", "WLC", "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT",
+                )
+            self._live_ap_cols_mobility = self._live_show_mobility
+        else:
+            table.clear()
 
-            table.add_row(
-                ap.name,
-                ap.wlc_name or "—",
-                bas_txt,
-                prev_txt,
-                cur_txt,
-                since_by_mac.get(ap.wtp_mac, "—"),
-                key=ap.wtp_mac or ap.name,
-            )
+        baseline_map   = self._live_records_by_mac(self._live_baseline, focused)
+        prev_map       = self._live_records_by_mac(self._live_prev,     focused)
+        current_by_mac = self._live_records_by_mac(self._live_current,  focused)
+        for ap in self._live_ap_union(current_by_mac, focused):
+            self._add_live_ap_row(table, ap, current_by_mac, baseline_map, prev_map)
 
     def _refresh_live_event_table(self) -> None:
         table = self.query_one("#live-event-table", DataTable)
@@ -1622,6 +1743,70 @@ class MainScreen(Screen):
                 nj_txt,
                 str(p.other),
             )
+
+    def _add_live_ap_row(
+        self,
+        table: DataTable,
+        ap: APRecord,
+        current_by_mac: Dict[str, APRecord],
+        baseline_map:   Dict[str, APRecord],
+        prev_map:       Dict[str, APRecord],
+    ) -> None:
+        """Compute one AP's display values and add it to the live AP table."""
+        is_missing = ap.wtp_mac not in current_by_mac
+        baseline   = baseline_map.get(ap.wtp_mac)
+        prev       = prev_map.get(ap.wtp_mac)
+        eff_state  = "not_joined" if is_missing else ap.state
+        bl_wlc     = baseline.wlc_name if baseline else None
+        cur_wlc    = ap.wlc_name if not is_missing else None
+        moved      = bool(bl_wlc and cur_wlc and bl_wlc != cur_wlc)
+
+        if self._live_only_changes and not _live_ap_changed(
+            is_missing, moved, baseline, prev, eff_state
+        ):
+            return
+
+        bas_txt, prev_txt, cur_txt = _live_ap_state_texts(ap, is_missing, baseline, prev)
+        since = self._live_since_by_mac.get(ap.wtp_mac, "—")
+
+        if self._live_show_mobility:
+            moved_txt, bl_wlc_txt, cur_wlc_txt = _live_ap_mobility_texts(bl_wlc, cur_wlc, moved)
+            table.add_row(
+                ap.name, ap.wtp_mac or "—",
+                bl_wlc_txt, cur_wlc_txt, moved_txt,
+                bas_txt, prev_txt, cur_txt, since,
+                key=ap.wtp_mac or ap.name,
+            )
+        else:
+            table.add_row(
+                ap.name, ap.wtp_mac or "—", ap.wlc_name or "—",
+                bas_txt, prev_txt, cur_txt, since,
+                key=ap.wtp_mac or ap.name,
+            )
+
+    def _live_records_by_mac(
+        self,
+        store: Dict[str, List[APRecord]],
+        focused: Optional[str],
+    ) -> Dict[str, APRecord]:
+        return {
+            r.wtp_mac: r
+            for wlc, recs in store.items()
+            if focused is None or wlc == focused
+            for r in recs
+        }
+
+    def _live_ap_union(
+        self,
+        current_by_mac: Dict[str, APRecord],
+        focused: Optional[str],
+    ) -> List[APRecord]:
+        aps = list(current_by_mac.values())
+        for mac, rec in self._live_known.items():
+            if mac not in current_by_mac and (focused is None or rec.wlc_name == focused):
+                aps.append(rec)
+        aps.sort(key=lambda r: (r.wlc_name.lower(), r.name.lower()))
+        return aps
 
     def _rebuild_live_wlc_bar(self) -> None:
         bar = self.query_one("#live-wlc-bar")
