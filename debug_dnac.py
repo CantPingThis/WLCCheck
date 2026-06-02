@@ -181,7 +181,7 @@ else:
                 break
 
     if ap_node is None:
-        err("AP node not found in topology by id, IP, or hostname.")
+        warn("AP node not found in topology by id, IP, or hostname.")
         print(f"\n  device_id (network-device API) : {device_id}")
         print(f"  managementIpAddress            : {device_ip}")
         print(f"  hostname                       : {device_host}")
@@ -189,8 +189,7 @@ else:
         for n in nodes[:5]:
             print(f"    id={n['id'][:36]}  label={n.get('label')}  ip={n.get('ip')}")
         print("\n  → AP exists in inventory but DNAC has no topology node for it.")
-        print("    Physical connectivity cannot be retrieved via this API.")
-        sys.exit(1)
+        print("    Continuing to Step 8 (enrichment API) which may still have data.")
 
     if effective_id != device_id:
         warn(f"Using topology node id={effective_id} (differs from network-device id)")
@@ -207,21 +206,24 @@ matching = [
 ]
 
 if not matching:
-    err("No link found in topology for this node.")
-    print("\n  Node details:")
-    for k, v in sorted(ap_node.items()):
-        print(f"    {k:35s} = {v!r}")
+    warn("No link found in topology for this node.")
+    if ap_node:
+        print("\n  Node details:")
+        for k, v in sorted(ap_node.items()):
+            print(f"    {k:35s} = {v!r}")
     print("\n  → AP is in the topology node list but has no physical link.")
     print("    The switch connection may not be captured via CDP/LLDP in DNAC.")
-    sys.exit(1)
-
-ok(f"Found {len(matching)} link(s).")
+    print("    Continuing to Step 8 (enrichment API) which may still have data.")
+else:
+    ok(f"Found {len(matching)} link(s).")
 
 # ---------------------------------------------------------------------------
 # Step 6 — Dump ALL fields of each matching link
 # ---------------------------------------------------------------------------
 
 step("Step 6 — Raw link data (all fields)")
+if not matching:
+    warn("No links to display — skipping to Step 7.")
 for i, lnk in enumerate(matching, 1):
     src_id  = lnk.get("source", "")
     tgt_id  = lnk.get("target", "")
@@ -242,6 +244,8 @@ for i, lnk in enumerate(matching, 1):
 # ---------------------------------------------------------------------------
 
 step("Step 7 — Summary (what the app reads)")
+if not matching:
+    warn("No topology links — summary skipped.")
 for lnk in matching:
     src_id = lnk.get("source", "")
     tgt_id = lnk.get("target", "")
@@ -264,3 +268,129 @@ for lnk in matching:
                       if v and any(x in k.lower() for x in ("port", "interface", "intf"))}
         for k, v in candidates.items():
             print(f"    {k:40s} = {v!r}")
+
+# ---------------------------------------------------------------------------
+# Step 8 — Device Enrichment Details (fallback for unmanaged switches)
+# ---------------------------------------------------------------------------
+# This endpoint aggregates CDP/LLDP data from the WLC/AP channel and can show
+# the connected switch + port even when the switch is not managed by DNAC.
+# Used by the Device 360 GUI view.
+
+step("Step 8 — Device Enrichment Details API (neighbour data via CDP)")
+enrich_ip = device_ip or AP_LOOKUP
+
+try:
+    r = requests.get(
+        f"{BASE}/dna/intent/api/v1/device/enrichment-details",
+        headers={**HDR, "entity_type": "network_device", "entity_value": enrich_ip},
+        verify=VERIFY,
+        timeout=15,
+    )
+    if r.status_code == 404:
+        warn("Enrichment endpoint returned 404 — not supported on this DNAC version.")
+    elif r.status_code in (400, 422):
+        warn(f"Enrichment endpoint returned {r.status_code} — trying ip_address entity_type…")
+        r = requests.get(
+            f"{BASE}/dna/intent/api/v1/device/enrichment-details",
+            headers={**HDR, "entity_type": "ip_address", "entity_value": enrich_ip},
+            verify=VERIFY,
+            timeout=15,
+        )
+        r.raise_for_status()
+        ok(f"Enrichment responded ({r.status_code}) with ip_address entity_type.")
+    else:
+        r.raise_for_status()
+        ok(f"Enrichment responded ({r.status_code}).")
+
+    if r.status_code != 404:
+        try:
+            body = r.json()
+        except Exception:
+            warn("Could not parse JSON from enrichment response.")
+            body = None
+
+        if body:
+            print("\n  Full enrichment response structure (top-level keys):")
+            if isinstance(body, list):
+                print(f"  Response is a list of {len(body)} item(s).")
+                items = body
+            else:
+                items = [body]
+
+            for idx, item in enumerate(items[:3]):
+                print(f"\n  --- Enrichment item {idx+1} ---")
+
+                # Device details
+                dev_detail = item.get("deviceDetails", {})
+                if dev_detail:
+                    print(f"  deviceDetails.id            = {dev_detail.get('id')!r}")
+                    print(f"  deviceDetails.hostname      = {dev_detail.get('hostname')!r}")
+                    print(f"  deviceDetails.managementIpAddress = {dev_detail.get('managementIpAddress')!r}")
+
+                    neighbors = dev_detail.get("neighborTopology", [])
+                    if neighbors:
+                        ok(f"  neighborTopology: {len(neighbors)} neighbour(s)")
+                        for ni, nbr in enumerate(neighbors[:5]):
+                            print(f"\n    Neighbour {ni+1}:")
+                            for k, v in sorted(nbr.items()):
+                                print(f"      {k:35s} = {v!r}")
+                    else:
+                        warn("  neighborTopology is empty in deviceDetails.")
+
+                # Also dump all top-level keys we haven't printed
+                remaining = {k: v for k, v in item.items() if k != "deviceDetails"}
+                if remaining:
+                    print("\n  Other top-level fields:")
+                    for k, v in sorted(remaining.items()):
+                        if isinstance(v, (str, int, float, bool)) or v is None:
+                            print(f"    {k:35s} = {v!r}")
+                        else:
+                            print(f"    {k:35s} = [{type(v).__name__}]")
+
+except Exception as exc:
+    err(f"Enrichment API call failed: {exc}")
+
+# ---------------------------------------------------------------------------
+# Step 9 — CDP neighbour list via device detail
+# ---------------------------------------------------------------------------
+# Another path: /dna/intent/api/v1/topology/physical-topology?nodeType=ap
+# fetches only APs.  But more useful is the raw CDP table for the device.
+
+step("Step 9 — Topology filtered to nodeType=ap (quick sanity check)")
+try:
+    r = requests.get(
+        f"{BASE}/dna/intent/api/v1/topology/physical-topology",
+        headers=HDR,
+        params={"nodeType": "ap"},
+        verify=VERIFY,
+        timeout=20,
+    )
+    r.raise_for_status()
+    ap_topo = r.json().get("response", {})
+    ap_nodes = ap_topo.get("nodes", [])
+    ap_links = ap_topo.get("links", [])
+    ok(f"AP-filtered topology: {len(ap_nodes)} nodes, {len(ap_links)} links")
+
+    # Find our AP in this subset
+    our_ap_ids = set()
+    for n in ap_nodes:
+        if (device_ip and n.get("ip") == device_ip) or \
+           (device_host and n.get("label", "").lower() == device_host.lower()) or \
+           n.get("id") == device_id:
+            our_ap_ids.add(n["id"])
+            ok(f"Found our AP in ap-filtered topology: id={n['id']}  label={n.get('label')}  ip={n.get('ip')}")
+
+    ap_node_map = {n["id"]: n.get("label") or n.get("ip") or "?" for n in ap_nodes}
+    for lnk in ap_links:
+        if lnk.get("source") in our_ap_ids or lnk.get("target") in our_ap_ids:
+            src_lbl = ap_node_map.get(lnk.get("source", ""), lnk.get("source", "?"))
+            tgt_lbl = ap_node_map.get(lnk.get("target", ""), lnk.get("target", "?"))
+            print(f"\n  Link: {src_lbl} → {tgt_lbl}")
+            for k, v in sorted(lnk.items()):
+                print(f"    {k:40s} = {v!r}")
+
+    if not our_ap_ids:
+        warn("AP not found in nodeType=ap filtered topology either.")
+
+except Exception as exc:
+    err(f"AP-filtered topology call failed: {exc}")
