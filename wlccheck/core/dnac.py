@@ -90,7 +90,12 @@ class DNACClient:
                 device = self._get_device_by_hostname(token, ap_name)
             if device is None:
                 return None
-            return self._find_port(token, device["id"])
+            return self._find_port(
+                token,
+                device_id=device["id"],
+                ip_addr=ip_addr,
+                hostname=device.get("hostname", ""),
+            )
         except Exception:
             return None
 
@@ -150,22 +155,51 @@ class DNACClient:
         self._topo_ts = time.monotonic()
         return self._topo
 
-    def _find_port(self, token: str, device_id: str) -> Optional[PortInfo]:
-        topo  = self._get_topology(token)
-        nodes = {n["id"]: n.get("label") or n.get("ip") or "?" for n in topo.get("nodes", [])}
+    def _find_port(
+        self,
+        token:     str,
+        device_id: str,
+        ip_addr:   str = "",
+        hostname:  str = "",
+    ) -> Optional[PortInfo]:
+        topo      = self._get_topology(token)
+        raw_nodes = topo.get("nodes", [])
+        node_map  = {n["id"]: n.get("label") or n.get("ip") or "?" for n in raw_nodes}
+        eid       = self._resolve_topology_id(raw_nodes, device_id, ip_addr, hostname)
+
         for link in topo.get("links", []):
             src = link.get("source")
             tgt = link.get("target")
-            if src == device_id:
-                # AP is source  → switch is target, its port = targetInterfaceName
+            if src == eid:
                 return PortInfo(
-                    switch_name=nodes.get(tgt, "—"),
-                    switch_port=link.get("targetInterfaceName") or "—",
+                    switch_name=node_map.get(tgt, "—"),
+                    switch_port=link.get("endPortName") or "—",
                 )
-            if tgt == device_id:
-                # AP is target → switch is source, its port = sourceInterfaceName
+            if tgt == eid:
                 return PortInfo(
-                    switch_name=nodes.get(src, "—"),
-                    switch_port=link.get("sourceInterfaceName") or "—",
+                    switch_name=node_map.get(src, "—"),
+                    switch_port=link.get("startPortName") or "—",
                 )
         return None
+
+    @staticmethod
+    def _resolve_topology_id(
+        nodes:     list,
+        device_id: str,
+        ip_addr:   str,
+        hostname:  str,
+    ) -> str:
+        """Return the topology node ID that matches this device.
+
+        The UUID from the network-device API sometimes differs from the node ID
+        used in topology links; fall back to matching by IP then by hostname.
+        """
+        known_ids = {n["id"] for n in nodes}
+        if device_id in known_ids:
+            return device_id
+        for n in nodes:
+            if ip_addr and n.get("ip") == ip_addr:
+                return n["id"]
+            if hostname and n.get("label", "").lower() == hostname.lower():
+                return n["id"]
+        return device_id
