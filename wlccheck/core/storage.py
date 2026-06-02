@@ -225,13 +225,19 @@ class SnapshotDB:
     # Read
     # ------------------------------------------------------------------
 
-    def get_recent_runs(self, limit: int = 8) -> List[Run]:
+    def get_recent_runs(self, limit: Optional[int] = None) -> List[Run]:
         with self._connect() as conn:
-            run_rows = conn.execute(
-                "SELECT uuid, label, session_type, created_at, has_clients "
-                "FROM runs ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if limit is not None:
+                run_rows = conn.execute(
+                    "SELECT uuid, label, session_type, created_at, has_clients "
+                    "FROM runs ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                run_rows = conn.execute(
+                    "SELECT uuid, label, session_type, created_at, has_clients "
+                    "FROM runs ORDER BY created_at DESC",
+                ).fetchall()
 
         runs: List[Run] = []
         for uuid, label, stype, created_at, has_clients in run_rows:
@@ -312,6 +318,12 @@ class SnapshotDB:
                     col = "run_uuid" if tbl != "runs" else "uuid"
                     conn.execute(f"DELETE FROM {tbl} WHERE {col} IN ({ph})", old)
         return len(old)
+
+    def delete_run(self, run_uuid: str) -> None:
+        with self._connect() as conn:
+            for tbl in ("client_snapshots", "wlan_snapshots", "ap_snapshots", "run_wlcs"):
+                conn.execute(f"DELETE FROM {tbl} WHERE run_uuid = ?", (run_uuid,))
+            conn.execute("DELETE FROM runs WHERE uuid = ?", (run_uuid,))
 
     # Legacy
     def get_recent_sessions(self, limit: int = 8) -> List[Session]:

@@ -24,6 +24,8 @@ class APDiff:
     # Tag changes (populated when change_type == "tag_change")
     pre_tags: tuple[str, str, str] = ("", "", "")
     post_tags: tuple[str, str, str] = ("", "", "")
+    # WLC move (populated when change_type == "wlc_move")
+    pre_wlc: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -223,12 +225,12 @@ def _diff_aps(
         pre  = pre_by_mac.get(mac)
         post = post_by_mac.get(mac)
         if pre and post:
-            state_changed = pre.state != post.state
-            tags_changed  = pre.tags_key != post.tags_key
-            if state_changed:
+            if pre.state != post.state:
                 diffs.append(_ap_state_change(pre, post))
-            if tags_changed:
+            if pre.tags_key != post.tags_key:
                 diffs.append(_ap_tag_change(pre, post))
+            if pre.wlc_name and post.wlc_name and pre.wlc_name != post.wlc_name:
+                diffs.append(_ap_wlc_move(pre, post))
         elif pre:
             diffs.append(_ap_disappeared(pre))
         else:
@@ -243,6 +245,8 @@ def _diff_aps(
                 diffs.append(_ap_state_change(pre, post))
             if pre.tags_key != post.tags_key:
                 diffs.append(_ap_tag_change(pre, post))
+            if pre.wlc_name and post.wlc_name and pre.wlc_name != post.wlc_name:
+                diffs.append(_ap_wlc_move(pre, post))
         elif pre:
             diffs.append(_ap_disappeared(pre))
         else:
@@ -295,6 +299,18 @@ def _ap_new(post: APRecord) -> APDiff:
         pre_state=None, post_state=post.state,
         change_type="new", severity="info",
         wlc_name=post.wlc_name,
+    )
+
+
+def _ap_wlc_move(pre: APRecord, post: APRecord) -> APDiff:
+    return APDiff(
+        name=pre.name, wtp_mac=pre.wtp_mac,
+        ip_addr=post.ip_addr or pre.ip_addr,
+        model=post.model or pre.model,
+        pre_state=pre.state, post_state=post.state,
+        change_type="wlc_move", severity="warning",
+        wlc_name=post.wlc_name,
+        pre_wlc=pre.wlc_name,
     )
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 _SEARCH_PATHS = [
@@ -15,11 +15,23 @@ _REQUIRED_COLS = {"name", "host"}
 
 
 # ---------------------------------------------------------------------------
-# Model
+# Models
 # ---------------------------------------------------------------------------
 
 @dataclass
 class WLCEntry:
+    name: str
+    host: str
+    datacenter: str = ""
+
+    def __str__(self) -> str:
+        if self.datacenter:
+            return f"{self.name}  [{self.datacenter}]"
+        return self.name
+
+
+@dataclass
+class DNACEntry:
     name: str
     host: str
     datacenter: str = ""
@@ -51,10 +63,32 @@ def find_inventory() -> Optional[Path]:
 
 
 def load_inventory(path: Path) -> List[WLCEntry]:
-    """Parse a WLC inventory CSV and return a list of WLCEntry objects.
+    """Parse a WLC inventory CSV and return WLC entries only.
 
-    Raises InventoryError on missing columns or empty file.
+    Rows with ``type=dnac`` are silently skipped so the file can contain both
+    WLC and DNAC entries without breaking existing callers.
+
+    Raises InventoryError on missing columns or no WLC entries.
     """
+    wlcs, _ = _parse_all(path)
+    if not wlcs:
+        raise InventoryError(f"Inventory CSV has no WLC entries: {path}")
+    return wlcs
+
+
+def load_dnac_entries(path: Path) -> List[DNACEntry]:
+    """Return DNAC entries (rows with ``type=dnac``) from the inventory CSV."""
+    _, dnacs = _parse_all(path)
+    return dnacs
+
+
+# ---------------------------------------------------------------------------
+# Internal
+# ---------------------------------------------------------------------------
+
+def _parse_all(path: Path) -> Tuple[List[WLCEntry], List[DNACEntry]]:
+    wlcs:  List[WLCEntry]  = []
+    dnacs: List[DNACEntry] = []
     try:
         with open(path, newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
@@ -68,24 +102,25 @@ def load_inventory(path: Path) -> List[WLCEntry]:
                     f"CSV missing required column(s): {', '.join(sorted(missing))}"
                 )
 
-            entries: List[WLCEntry] = []
-            for i, row in enumerate(reader, start=2):  # row 1 = header
+            for i, row in enumerate(reader, start=2):
                 name = row.get("name", "").strip()
                 host = row.get("host", "").strip()
                 dc   = row.get("datacenter", "").strip()
+                typ  = row.get("type", "").strip().lower()
 
                 if not name or not host:
                     raise InventoryError(
                         f"Row {i}: 'name' and 'host' must not be empty."
                     )
-                entries.append(WLCEntry(name=name, host=host, datacenter=dc))
+
+                if typ == "dnac":
+                    dnacs.append(DNACEntry(name=name, host=host, datacenter=dc))
+                else:
+                    wlcs.append(WLCEntry(name=name, host=host, datacenter=dc))
 
     except InventoryError:
         raise
     except OSError as exc:
         raise InventoryError(f"Cannot read inventory file: {exc}") from exc
 
-    if not entries:
-        raise InventoryError(f"Inventory CSV has no WLC entries: {path}")
-
-    return entries
+    return wlcs, dnacs

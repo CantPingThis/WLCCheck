@@ -769,3 +769,54 @@ CommandPalette > .command-palette--list > .option-list--option-highlighted {
     background: #1c2d42;
     color: #58a6ff;
 }
+
+/* ----- AP Detail modal -------------------------------------- */
+APDetailModal {
+    align: center middle;
+}
+
+#ap-detail-dialog {
+    width: 62;
+    height: auto;
+    max-height: 42;
+    background: #161b22;
+    border: double #388bfd;
+    padding: 2 3;
+    layer: overlay;
+}
+
+.ap-detail-section {
+    color: #8b949e;
+    text-style: bold;
+    margin-top: 1;
+    margin-bottom: 0;
+}
+
+.ap-detail-row {
+    height: 1;
+}
+
+.ap-detail-key {
+    color: #8b949e;
+    width: 12;
+    padding: 0 1 0 2;
+}
+
+.ap-detail-val {
+    color: #e6edf3;
+    width: 1fr;
+}
+
+.ap-detail-placeholder {
+    color: #484f58;
+}
+
+.ap-detail-loading {
+    color: #484f58;
+    text-style: italic;
+}
+
+.ap-detail-state {
+    padding: 0 2;
+    height: 1;
+}

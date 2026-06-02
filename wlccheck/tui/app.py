@@ -16,7 +16,6 @@ from textual.command import Command, Provider
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen, Screen
-from textual.css.query import NoMatches
 from textual.timer import Timer
 from textual.widgets import (
     Button,
@@ -37,7 +36,20 @@ from textual.widgets import (
 from textual.widgets.selection_list import Selection
 
 from ..core.diff import DiffSummary, compute_diff
-from ..core.inventory import InventoryError, WLCEntry, find_inventory, load_inventory
+from ..core.dnac import (
+    PortInfo as DNACPortInfo,
+    get_client as get_dnac_client,
+    is_dnac_configured,
+    set_inventory_host as set_dnac_host,
+)
+from ..core.inventory import (
+    DNACEntry,
+    InventoryError,
+    WLCEntry,
+    find_inventory,
+    load_dnac_entries,
+    load_inventory,
+)
 from ..core.models import (
     APRecord,
     APStats,
@@ -46,10 +58,9 @@ from ..core.models import (
     ClientStats,
     LivePollRecord,
     Run,
-    WLANRecord,
     WLCResult,
 )
-from ..core.restconf import WLCAuthError, WLCClient, WLCConnectionError, WLCError
+from ..core.restconf import WLCAuthError, WLCClient
 from ..core.storage import SnapshotDB
 
 
@@ -159,6 +170,7 @@ _CHANGE_FMT: dict[str, tuple[str, str]] = {
     "degraded":     ("↓", _S_YELLOW),
     "state_change": ("~", "yellow"),
     "tag_change":   ("⊘", _S_YELLOW),
+    "wlc_move":     ("⇄", _S_YELLOW),
     "recovered":    ("▲", _S_GREEN),
     "new":          ("★", _S_CYAN),
     "down":         ("▼", _S_RED),
@@ -230,9 +242,9 @@ def _live_ap_mobility_texts(
 ) -> "tuple[Text, Text, Text]":
     if moved:
         return (
-            Text("→",             style="bold yellow"),
+            Text("→",             style=_S_YELLOW),
             Text(bl_wlc,          style="dim"),         # type: ignore[arg-type]
-            Text(cur_wlc,         style="bold yellow"),  # type: ignore[arg-type]
+            Text(cur_wlc,         style=_S_YELLOW),  # type: ignore[arg-type]
         )
     return (
         Text("—",             style="dim"),
@@ -364,7 +376,7 @@ def _fmt_tags(tags: tuple[str, str, str]) -> str:
 
 class CredentialModal(ModalScreen):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
-    CSS_PATH = "styles.tcss"
+    CSS_PATH = _CSS
 
     def __init__(self, prefill_user: str = "") -> None:
         super().__init__()
@@ -384,13 +396,13 @@ class CredentialModal(ModalScreen):
 
     def on_mount(self) -> None:
         self.query_one(
-            "#password-input" if self._prefill_user else "#username-input", Input
+            _WID_PW_INPUT if self._prefill_user else "#username-input", Input
         ).focus()
 
     @on(Button.Pressed, "#confirm-btn")
     def _confirm(self) -> None:
         u = self.query_one("#username-input", Input).value.strip()
-        p = self.query_one("#password-input", Input).value
+        p = self.query_one(_WID_PW_INPUT, Input).value
         if u and p:
             self.dismiss((u, p))
 
@@ -401,7 +413,7 @@ class CredentialModal(ModalScreen):
     @on(Input.Submitted)
     def _on_submit(self, event: Input.Submitted) -> None:
         if event.input.id == "username-input":
-            self.query_one("#password-input", Input).focus()
+            self.query_one(_WID_PW_INPUT, Input).focus()
         else:
             self._confirm()
 
@@ -414,7 +426,7 @@ class RunOptionsModal(ModalScreen):
     """Set run label and choose optional data collection."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
-    CSS_PATH = "styles.tcss"
+    CSS_PATH = _CSS
 
     def __init__(self, prefill_label: str = "", title: str = "Run Options") -> None:
         super().__init__()
@@ -460,11 +472,11 @@ class RunOptionsModal(ModalScreen):
                 yield Button("Start →", classes="primary-btn", id="confirm-btn")
 
     def on_mount(self) -> None:
-        self.query_one("#label-input", Input).focus()
+        self.query_one(_WID_LABEL_INPUT, Input).focus()
 
     @on(Button.Pressed, "#confirm-btn")
     def _confirm(self) -> None:
-        label           = self.query_one("#label-input", Input).value.strip() or None
+        label           = self.query_one(_WID_LABEL_INPUT, Input).value.strip() or None
         collect_clients = self.query_one("#cb-clients",  Checkbox).value
         cb_live         = self.query_one("#cb-live",     Checkbox).value
         sel             = self.query_one("#live-interval", Select)
@@ -486,7 +498,7 @@ class RunOptionsModal(ModalScreen):
 
 class ConnectModal(ModalScreen):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
-    CSS_PATH = "styles.tcss"
+    CSS_PATH = _CSS
 
     def __init__(self, prefill_host: str = "", prefill_label: str = "") -> None:
         super().__init__()
@@ -520,13 +532,13 @@ class ConnectModal(ModalScreen):
 
     def on_mount(self) -> None:
         self.query_one(
-            "#label-input" if self._prefill_host else "#host-input", Input
+            _WID_LABEL_INPUT if self._prefill_host else "#host-input", Input
         ).focus()
 
     @on(Button.Pressed, "#confirm-btn")
     def _confirm(self) -> None:
         host  = self.query_one("#host-input",  Input).value.strip()
-        label = self.query_one("#label-input", Input).value.strip() or None
+        label = self.query_one(_WID_LABEL_INPUT, Input).value.strip() or None
         collect_clients = self.query_one("#cb-clients", Checkbox).value
         cb_live         = self.query_one("#cb-live",    Checkbox).value
         sel             = self.query_one("#live-interval", Select)
@@ -541,7 +553,7 @@ class ConnectModal(ModalScreen):
     @on(Input.Submitted)
     def _on_submit(self, event: Input.Submitted) -> None:
         if event.input.id == "host-input":
-            self.query_one("#label-input", Input).focus()
+            self.query_one(_WID_LABEL_INPUT, Input).focus()
         else:
             self._confirm()
 
@@ -556,7 +568,7 @@ class WLCPickerModal(ModalScreen):
         Binding("a",      "select_all",  "All"),
         Binding("n",      "select_none", "None"),
     ]
-    CSS_PATH = "styles.tcss"
+    CSS_PATH = _CSS
 
     def __init__(self, entries: List[WLCEntry]) -> None:
         super().__init__()
@@ -579,11 +591,11 @@ class WLCPickerModal(ModalScreen):
                 yield Button("Next →",  classes="primary-btn", id="confirm-btn")
 
     def on_mount(self) -> None:
-        self.query_one("#wlc-selection", SelectionList).focus()
+        self.query_one(_WID_WLC_SEL, SelectionList).focus()
 
     @on(Button.Pressed, "#confirm-btn")
     def _confirm(self) -> None:
-        sl = self.query_one("#wlc-selection", SelectionList)
+        sl = self.query_one(_WID_WLC_SEL, SelectionList)
         chosen = [e for e in self._entries if e.host in set(sl.selected)]
         if chosen:
             self.dismiss(chosen)
@@ -593,10 +605,10 @@ class WLCPickerModal(ModalScreen):
         self.dismiss(None)
 
     def action_select_all(self) -> None:
-        self.query_one("#wlc-selection", SelectionList).select_all()
+        self.query_one(_WID_WLC_SEL, SelectionList).select_all()
 
     def action_select_none(self) -> None:
-        self.query_one("#wlc-selection", SelectionList).deselect_all()
+        self.query_one(_WID_WLC_SEL, SelectionList).deselect_all()
 
 
 # ===========================================================================
@@ -604,12 +616,15 @@ class WLCPickerModal(ModalScreen):
 # ===========================================================================
 
 class RunPickerModal(ModalScreen):
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-    CSS_PATH = "styles.tcss"
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("d",      "delete_run", "Delete", show=True),
+    ]
+    CSS_PATH = _CSS
 
     def __init__(self, runs: List[Run]) -> None:
         super().__init__()
-        self._runs = runs
+        self._runs = list(runs)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="picker-dialog"):
@@ -620,34 +635,169 @@ class RunPickerModal(ModalScreen):
             )
             yield Rule(classes="dialog-rule")
             yield DataTable(id="session-table", cursor_type="row", zebra_stripes=True)
-            yield Label("\\[Enter] Select   \\[Esc] Cancel", id="picker-hint")
+            yield Label(
+                "\\[Enter] Select   \\[d] Delete   \\[Esc] Cancel",
+                id="picker-hint",
+            )
 
     def on_mount(self) -> None:
+        self._current_row_uuid: Optional[str] = self._runs[0].uuid if self._runs else None
         table = self.query_one("#session-table", DataTable)
         table.add_columns("LABEL", "WLCs", "APs", "JOINED", "CLIENTS", "FAILED", "COLLECTED")
         for r in self._runs:
-            failed = len(r.failed_wlcs)
-            fail_txt = Text(str(failed), style=_S_RED) if failed else Text("0", style="dim")
-            client_txt = Text("✓", style="bold cyan") if r.has_clients else Text("—", style="dim")
-            table.add_row(
-                r.display_label,
-                str(len(r.wlc_results)),
-                str(r.stats.total),
-                str(r.stats.joined),
-                client_txt,
-                fail_txt,
-                r.display_time,
-                key=r.uuid,
-            )
+            self._add_run_row(table, r)
         table.focus()
+
+    def _add_run_row(self, table: DataTable, r: Run) -> None:
+        failed     = len(r.failed_wlcs)
+        fail_txt   = Text(str(failed), style=_S_RED) if failed else Text("0", style="dim")
+        client_txt = Text("✓", style="bold cyan") if r.has_clients else Text("—", style="dim")
+        table.add_row(
+            r.display_label,
+            str(len(r.wlc_results)),
+            str(r.stats.total),
+            str(r.stats.joined),
+            client_txt,
+            fail_txt,
+            r.display_time,
+            key=r.uuid,
+        )
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._current_row_uuid = str(event.row_key.value) if event.row_key else None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         uuid = str(event.row_key.value)
         run  = next((r for r in self._runs if r.uuid == uuid), None)
         self.dismiss(run)
 
+    def action_delete_run(self) -> None:
+        uuid = self._current_row_uuid
+        if not uuid:
+            return
+        idx = next((i for i, r in enumerate(self._runs) if r.uuid == uuid), -1)
+        if idx == -1:
+            return
+        SnapshotDB().delete_run(uuid)
+        self._runs = [r for r in self._runs if r.uuid != uuid]
+        self.query_one("#session-table", DataTable).remove_row(uuid)
+        if not self._runs:
+            self.dismiss(None)
+            return
+        # RowHighlighted may not fire when cursor index is unchanged (non-last row
+        # deleted, next row shifts up into the same slot). Recalculate explicitly.
+        self._current_row_uuid = self._runs[min(idx, len(self._runs) - 1)].uuid
+
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+# ===========================================================================
+# AP Detail modal
+# ===========================================================================
+
+class APDetailModal(ModalScreen):
+    BINDINGS = [Binding("escape", "dismiss", "Close")]
+    CSS_PATH = _CSS
+
+    def __init__(self, ap: APRecord) -> None:
+        super().__init__()
+        self._ap = ap
+
+    def compose(self) -> ComposeResult:
+        ap = self._ap
+        dnac_configured = is_dnac_configured() and bool(ap.ip_addr or ap.name)
+        net_placeholder = "Chargement…" if dnac_configured else "—"
+        net_class       = "ap-detail-loading" if dnac_configured else "ap-detail-placeholder"
+
+        with Vertical(id="ap-detail-dialog"):
+            yield Label(ap.name or "Unknown AP", classes="dialog-title")
+            yield Rule(classes="dialog-rule")
+
+            yield Static(_fmt_state(ap.state), classes="ap-detail-state")
+
+            yield Rule(classes="dialog-rule")
+
+            yield Label("IDENTITY", classes="ap-detail-section")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("WLC",      classes="ap-detail-key")
+                yield Label(ap.wlc_name  or "—", classes="ap-detail-val")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("MAC",      classes="ap-detail-key")
+                yield Label(ap.wtp_mac  or "—", classes="ap-detail-val")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("IP",       classes="ap-detail-key")
+                yield Label(ap.ip_addr  or "—", classes="ap-detail-val")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("Model",    classes="ap-detail-key")
+                yield Label(ap.model    or "—", classes="ap-detail-val")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("Location", classes="ap-detail-key")
+                yield Label(ap.location or "—", classes="ap-detail-val")
+
+            yield Rule(classes="dialog-rule")
+
+            yield Label("TAGS", classes="ap-detail-section")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("Policy",   classes="ap-detail-key")
+                yield Label(ap.policy_tag or "—", classes="ap-detail-val")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("Site",     classes="ap-detail-key")
+                yield Label(ap.site_tag   or "—", classes="ap-detail-val")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("RF",       classes="ap-detail-key")
+                yield Label(ap.rf_tag    or "—", classes="ap-detail-val")
+
+            yield Rule(classes="dialog-rule")
+
+            yield Label("NETWORK CONNECTIVITY", classes="ap-detail-section")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("Switch",   classes="ap-detail-key")
+                yield Label(net_placeholder, id="detail-switch",
+                            classes=f"ap-detail-val {net_class}")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("Port",     classes="ap-detail-key")
+                yield Label(net_placeholder, id="detail-port",
+                            classes=f"ap-detail-val {net_class}")
+
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Close", classes="cancel-btn", id="close-btn")
+
+    def on_mount(self) -> None:
+        ap = self._ap
+        if is_dnac_configured() and (ap.ip_addr or ap.name):
+            self._fetch_port_info()
+
+    @work(thread=True)
+    def _fetch_port_info(self) -> None:
+        app    = self.app
+        client = get_dnac_client(username=app.username, password=app.password)
+        if client is None:
+            return
+        result: Optional[DNACPortInfo] = client.get_ap_port(
+            self._ap.ip_addr or "", self._ap.name or ""
+        )
+        self.app.call_from_thread(self._apply_port_info, result)
+
+    def _apply_port_info(self, info: Optional[DNACPortInfo]) -> None:
+        switch_lbl = self.query_one("#detail-switch", Label)
+        port_lbl   = self.query_one("#detail-port",   Label)
+        if info is not None:
+            switch_lbl.update(info.switch_name)
+            port_lbl.update(info.switch_port)
+            for lbl in (switch_lbl, port_lbl):
+                lbl.remove_class("ap-detail-loading")
+                lbl.add_class("ap-detail-val")
+        else:
+            switch_lbl.update("—")
+            port_lbl.update("—")
+            for lbl in (switch_lbl, port_lbl):
+                lbl.remove_class("ap-detail-loading")
+                lbl.add_class("ap-detail-placeholder")
+
+    @on(Button.Pressed, "#close-btn")
+    def _close(self) -> None:
+        self.dismiss()
 
 
 # ===========================================================================
@@ -740,7 +890,7 @@ class MainScreen(Screen):
                         yield Label("JOINED",     classes="stat-label")
                         yield Label("—", id="val-joined", classes="stat-value")
                     with Vertical(classes="stat-box", id="stat-njoin"):
-                        yield Label("NOT JOINED", classes="stat-label")
+                        yield Label(_COL_NOT_JOINED, classes="stat-label")
                         yield Label("—", id="val-njoin",  classes="stat-value")
                     with Vertical(classes="stat-box", id="stat-clients"):
                         yield Label("CLIENTS",    classes="stat-label")
@@ -772,7 +922,7 @@ class MainScreen(Screen):
                         yield Label("DELTA",     classes="stat-label")
                         yield Label("—", id="live-val-delta",    classes="stat-value")
                     with Vertical(classes="stat-box", id="live-stat-poll"):
-                        yield Label("POLL #",    classes="stat-label")
+                        yield Label(_COL_POLL_NUM,    classes="stat-label")
                         yield Label("—", id="live-val-poll",     classes="stat-value")
                     with Vertical(classes="stat-box", id="live-stat-next"):
                         yield Label("NEXT POLL", classes="stat-label")
@@ -836,6 +986,8 @@ class MainScreen(Screen):
         self._live_wlc_list:        List[str]                  = []
         self._live_entries:         List[WLCEntry]             = []
         self._live_timer:           Optional[Timer]            = None
+        self._ap_by_row_key:        Dict[str, APRecord]        = {}
+        self._last_ap_row_key:      Optional[str]              = None
 
         self.query_one("#ap-table", DataTable).add_columns(
             "WLC", "NAME", "STATE", "IP ADDRESS", "POLICY TAG", "SITE TAG", "RF TAG"
@@ -850,23 +1002,23 @@ class MainScreen(Screen):
             "WLC", "HOST", "STATUS", "APs", "JOINED", "ERROR"
         )
         self.query_one("#diff-ap-table", DataTable).add_columns(
-            "WLC", "NAME", "PRE STATE", "POST STATE", "CHANGE", "SEVERITY", "TAGS"
+            "WLC", "NAME", _COL_PRE_STATE, _COL_POST_STATE, "CHANGE", "SEVERITY", "TAGS"
         )
         self.query_one("#diff-wlan-table", DataTable).add_columns(
-            "WLC", "SSID", "PROFILE", "PRE STATE", "POST STATE", "CHANGE", "SEVERITY"
+            "WLC", "SSID", "PROFILE", _COL_PRE_STATE, _COL_POST_STATE, "CHANGE", "SEVERITY"
         )
         self.query_one("#diff-client-table", DataTable).add_columns(
             "WLC", "MAC", "AP", "SSID", "PRE IP", "POST IP",
-            "PRE STATE", "POST STATE", "CHANGE", "SEVERITY"
+            _COL_PRE_STATE, _COL_POST_STATE, "CHANGE", "SEVERITY"
         )
         self.query_one("#live-ap-table", DataTable).add_columns(
-            "NAME", "MAC", "WLC", "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT"
+            "NAME", "MAC", "WLC", "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT
         )
         self.query_one("#live-event-table", DataTable).add_columns(
-            "TIME", "POLL #", "WLC", "AP NAME", "FROM", "TO"
+            "TIME", _COL_POLL_NUM, "WLC", "AP NAME", "FROM", "TO"
         )
         self.query_one("#live-history-table", DataTable).add_columns(
-            "POLL #", "TIME", "WLC", "TOTAL", "JOINED", "NOT JOINED", "OTHER"
+            _COL_POLL_NUM, "TIME", "WLC", "TOTAL", "JOINED", _COL_NOT_JOINED, "OTHER"
         )
         self._show_view("welcome")
 
@@ -875,9 +1027,9 @@ class MainScreen(Screen):
     _HINTS = {
         "welcome":   "\\[c] Snapshot  \\[p] Post-Check  \\[Ctrl+P] Command Palette  \\[q] Quit",
         "loading":   "Collection in progress…",
-        "dashboard": "\\[c] New Snapshot  \\[p] Post-Check  \\[Ctrl+P] Commands  \\[q] Quit",
-        "diff":      "\\[o] Toggle All/Changes  \\[f] Severity Filter  \\[c] New Snapshot  \\[p] Post-Check  \\[Ctrl+P] Commands  \\[q] Quit",
-        "live":      "\\[Space] Pause/Resume  \\[r] Force Poll  \\[0] All WLCs  \\[1-9] Focus WLC  \\[o] All/Changed  \\[m] WLC Mobility  \\[x] Export CSV  \\[Esc] Back  \\[q] Quit",
+        "dashboard": "\\[c] New Snapshot  \\[p] Post-Check  \\[Enter] AP Detail  \\[Ctrl+P] Commands  \\[q] Quit",
+        "diff":      "\\[o] Toggle All/Changes  \\[f] Severity Filter  \\[Enter] AP Detail  \\[c] New Snapshot  \\[p] Post-Check  \\[Ctrl+P] Commands  \\[q] Quit",
+        "live":      "\\[Space] Pause/Resume  \\[r] Force Poll  \\[0] All WLCs  \\[1-9] Focus WLC  \\[o] All/Changed  \\[m] WLC Mobility  \\[Enter] AP Detail  \\[x] Export CSV  \\[Esc] Back  \\[q] Quit",
     }
 
     def _show_view(self, view: str) -> None:
@@ -886,7 +1038,7 @@ class MainScreen(Screen):
         self.query_one("#dashboard-panel").display = (view == "dashboard")
         self.query_one("#live-panel").display      = (view == "live")
         self.query_one("#diff-panel").display      = (view == "diff")
-        self.query_one("#error-bar").display       = False
+        self.query_one(_WID_ERROR_BAR).display       = False
         self.query_one("#hint-bar", Static).update(self._HINTS.get(view, ""))
 
     # ------------------------------------------------------------------ actions
@@ -900,7 +1052,7 @@ class MainScreen(Screen):
     def action_post_check(self) -> None:
         self._hide_error()
         db   = SnapshotDB()
-        runs = db.get_recent_runs(limit=8)
+        runs = db.get_recent_runs()
         if not runs:
             self._show_error("No snapshots found — take one first with \\[c].")
             return
@@ -951,7 +1103,7 @@ class MainScreen(Screen):
 
         with ap_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["NAME", "MAC", "WLC", "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT"])
+            w.writerow(["NAME", "MAC", "WLC", "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT])
             for ap in self._live_ap_union(current_by_mac, focused):
                 is_missing = ap.wtp_mac not in current_by_mac
                 baseline   = baseline_by_mac.get(ap.wtp_mac)
@@ -973,7 +1125,7 @@ class MainScreen(Screen):
                    if focused is None or e.wlc_name == focused]
         with ev_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["TIME", "POLL #", "WLC", "AP NAME", "MAC", "FROM", "TO"])
+            w.writerow(["TIME", _COL_POLL_NUM, "WLC", "AP NAME", "MAC", "FROM", "TO"])
             for evt in events:
                 w.writerow([
                     evt.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
@@ -991,7 +1143,7 @@ class MainScreen(Screen):
                      if focused is None or p.wlc_name == focused]
         with hist_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["POLL #", "TIME", "WLC", "TOTAL", "JOINED", "NOT JOINED", "OTHER"])
+            w.writerow([_COL_POLL_NUM, "TIME", "WLC", "TOTAL", "JOINED", _COL_NOT_JOINED, "OTHER"])
             for p in polls:
                 w.writerow([
                     p.poll_num,
@@ -1019,13 +1171,32 @@ class MainScreen(Screen):
         else:
             self._show_view("welcome")
 
-    def check_action(self, action: str, parameters: tuple) -> bool | None:
+    def check_action(self, action: str, _parameters: tuple) -> bool | None:
         if action in ("filter_diff", "toggle_unchanged"):
             return self._current_diff is not None or self._live_mode
         if action in ("live_pause", "live_refresh", "live_export",
                       "live_toggle_mobility", "live_exit"):
             return self._live_mode
         return True
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if (event.data_table.id or "") in {"ap-table", "live-ap-table", "diff-ap-table"}:
+            self._last_ap_row_key = str(event.row_key.value) if event.row_key else None
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if (event.data_table.id or "") not in {"ap-table", "live-ap-table", "diff-ap-table"}:
+            return
+        key = str(event.row_key.value)
+        ap = self._ap_record_for_row_key(key)
+        if ap is not None:
+            self.app.push_screen(APDetailModal(ap))
+
+    def _ap_record_for_row_key(self, key: str) -> Optional[APRecord]:
+        if key in self._ap_by_row_key:
+            return self._ap_by_row_key[key]
+        # Diff table uses wlc|mac|change_type — fall back to wlc|mac
+        base = key.rsplit("|", 1)[0]
+        return self._ap_by_row_key.get(base)
 
     def on_key(self, event) -> None:
         """Handle number keys to focus a WLC in live mode."""
@@ -1160,6 +1331,30 @@ class MainScreen(Screen):
         username = app.username
         password = app.password
         max_workers = min(len(entries), 8)
+
+        # Credential probe — validate on one WLC before launching parallel threads.
+        # Only needed when 2+ WLCs: a single failed attempt per device at once could
+        # lock the TACACS account. Skip for a single WLC (no parallel risk).
+        if len(entries) > 1:
+            probe = entries[0]
+            status(f"Validating credentials on [bold]{probe.name}[/bold]…")
+            try:
+                WLCClient(probe.host, username, password).check_auth()
+                status("[green]✓[/green] Credentials OK — starting parallel collection…")
+            except WLCAuthError as exc:
+                self.post_message(CollectionError(
+                    f"Authentication failed on {probe.name}: {exc}\n"
+                    "Parallel collection aborted — check your TACACS credentials."
+                ))
+                return
+            except Exception:
+                # Network / connectivity issue on the probe WLC — not an auth problem,
+                # proceed and let each WLC handle its own error.
+                status(
+                    f"[yellow]⚠[/yellow] Could not reach {probe.name} for credential "
+                    "probe (network error) — proceeding anyway…"
+                )
+
         status(f"Collecting from {len(entries)} WLC(s) — {max_workers} parallel threads…")
 
         results: List[WLCResult] = []
@@ -1245,7 +1440,11 @@ class MainScreen(Screen):
         # AP table
         ap_table = self.query_one("#ap-table", DataTable)
         ap_table.clear()
+        self._ap_by_row_key = {}
+        self._last_ap_row_key = None
         for ap in sorted(run.all_records, key=lambda r: (r.wlc_name.lower(), r.name.lower())):
+            _key = (ap.wlc_name or "") + "|" + (ap.wtp_mac or ap.name)
+            self._ap_by_row_key[_key] = ap
             ap_table.add_row(
                 ap.wlc_name   or "—",
                 ap.name,
@@ -1254,7 +1453,7 @@ class MainScreen(Screen):
                 ap.policy_tag or "—",
                 ap.site_tag   or "—",
                 ap.rf_tag     or "—",
-                key=(ap.wlc_name or "") + "|" + (ap.wtp_mac or ap.name),
+                key=_key,
             )
 
         # WLAN table
@@ -1371,6 +1570,14 @@ class MainScreen(Screen):
     def _render_diff_ap_table(self, summary: DiffSummary) -> None:
         table = self.query_one("#diff-ap-table", DataTable)
         table.clear()
+        self._ap_by_row_key = {}
+        self._last_ap_row_key = None
+
+        # Build AP lookup from post run for detail modal
+        post_ap_lookup: Dict[str, APRecord] = {}
+        if self._post_run:
+            for _ap in self._post_run.all_records:
+                post_ap_lookup[((_ap.wlc_name or "") + "|" + (_ap.wtp_mac or _ap.name))] = _ap
 
         # Build set of MAC/name keys that have a diff entry
         changed_keys: set[str] = {
@@ -1380,19 +1587,29 @@ class MainScreen(Screen):
 
         # Render changed rows (respects severity filter)
         for d in summary.filter_ap(self._diff_filter):
-            tags_txt = (
-                f"{_fmt_tags(d.pre_tags)} → {_fmt_tags(d.post_tags)}"
-                if d.change_type == "tag_change" else ""
-            )
+            if d.change_type == "tag_change":
+                tags_txt = f"{_fmt_tags(d.pre_tags)} → {_fmt_tags(d.post_tags)}"
+            else:
+                tags_txt = ""
+            if d.change_type == "wlc_move" and d.pre_wlc:
+                wlc_col = Text()
+                wlc_col.append(d.pre_wlc, style="dim yellow")
+                wlc_col.append(" ⇄ ", style=_S_YELLOW)
+                wlc_col.append(d.wlc_name, style=_S_YELLOW)
+            else:
+                wlc_col = Text(d.wlc_name or "—")
+            _base_key = (d.wlc_name or "") + "|" + (d.wtp_mac or d.name)
+            if _base_key in post_ap_lookup:
+                self._ap_by_row_key[_base_key] = post_ap_lookup[_base_key]
             table.add_row(
-                d.wlc_name or "—",
+                wlc_col,
                 d.name,
                 _fmt_state_or_dash(d.pre_state),
                 _fmt_state_or_dash(d.post_state),
                 _fmt_change(d.change_type),
                 _fmt_severity(d.severity),
                 tags_txt,
-                key=(d.wlc_name or "") + "|" + (d.wtp_mac or d.name),
+                key=_base_key + "|" + d.change_type,
             )
 
         # Render unchanged rows when not in "changed only" mode
@@ -1405,6 +1622,7 @@ class MainScreen(Screen):
                 row_key = (ap.wlc_name or "") + "|" + (ap.wtp_mac or ap.name)
                 if row_key in changed_keys:
                     continue  # already rendered above
+                self._ap_by_row_key[row_key] = ap
                 state_txt = _fmt_state(ap.state)
                 table.add_row(
                     ap.wlc_name   or "—",
@@ -1490,7 +1708,6 @@ class MainScreen(Screen):
         self._live_interval      = self._pending_live_interval or 60
         self._live_paused        = False
         self._live_poll_num      = 0
-        self._live_countdown     = 0   # triggers an immediate first poll on first tick
         self._live_only_changes  = False
         self._live_show_mobility = False
         self._live_focused_wlc   = None
@@ -1511,10 +1728,25 @@ class MainScreen(Screen):
         # Ordered WLC list (only successful results)
         self._live_wlc_list = [r.wlc_name for r in run.wlc_results if r.ok]
 
+        # Pre-populate current data from the just-completed collection so the
+        # table renders immediately — no need to wait for a second RESTCONF poll.
+        for result in run.wlc_results:
+            if result.ok and result.records:
+                self._live_current[result.wlc_name] = list(result.records)
+                for rec in result.records:
+                    self._live_known[rec.wtp_mac] = rec
+
         # Rebuild WLC bar buttons
         self._rebuild_live_wlc_bar()
 
         self._show_view("live")
+
+        # Render immediately with pre-populated data
+        self._refresh_live_ap_table()
+        self._refresh_live_stats()
+
+        # First re-poll fires after the configured interval, not immediately
+        self._live_countdown = self._live_interval
 
         # Start 1-second tick
         if self._live_timer is not None:
@@ -1614,6 +1846,30 @@ class MainScreen(Screen):
 
             self._live_current[wlc_name] = records
 
+        # Cross-WLC move detection: AP seen on a different WLC than the previous poll
+        all_prev = {
+            r.wtp_mac: r
+            for recs in self._live_prev.values()
+            for r in recs if r.wtp_mac
+        }
+        all_cur = {
+            r.wtp_mac: r
+            for recs in event.results.values()
+            for r in recs if r.wtp_mac
+        }
+        for mac, cur in all_cur.items():
+            prev = all_prev.get(mac)
+            if prev and prev.wlc_name and cur.wlc_name and prev.wlc_name != cur.wlc_name:
+                ts = now.strftime("%H:%M:%S")
+                self._live_events.append(APStateEvent(
+                    timestamp=now, poll_num=event.poll_num,
+                    wlc_name=cur.wlc_name,
+                    ap_name=cur.name, wtp_mac=mac,
+                    from_state=f"wlc:{prev.wlc_name}",
+                    to_state=f"wlc:{cur.wlc_name}",
+                ))
+                self._live_since_by_mac[mac] = ts
+
         self._update_live_ui()
 
     def _update_live_ui(self) -> None:
@@ -1664,7 +1920,7 @@ class MainScreen(Screen):
 
     def _update_countdown_label(self) -> None:
         if self._live_paused:
-            txt = Text("PAUSED", style="bold yellow")
+            txt = Text("PAUSED", style=_S_YELLOW)
         else:
             txt = Text(f"{self._live_countdown}s", style="cyan")
         try:
@@ -1675,6 +1931,8 @@ class MainScreen(Screen):
     def _refresh_live_ap_table(self) -> None:
         table   = self.query_one("#live-ap-table", DataTable)
         focused = self._live_focused_wlc
+        self._ap_by_row_key = {}
+        self._last_ap_row_key = None
 
         # Rebuild columns only when mobility mode actually changes
         if self._live_show_mobility != self._live_ap_cols_mobility:
@@ -1682,11 +1940,11 @@ class MainScreen(Screen):
             if self._live_show_mobility:
                 table.add_columns(
                     "NAME", "MAC", "BL WLC", "CUR WLC", "MOVED",
-                    "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT",
+                    "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT,
                 )
             else:
                 table.add_columns(
-                    "NAME", "MAC", "WLC", "BASELINE", "PREV POLL", "CURRENT", "CHANGED AT",
+                    "NAME", "MAC", "WLC", "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT,
                 )
             self._live_ap_cols_mobility = self._live_show_mobility
         else:
@@ -1695,8 +1953,9 @@ class MainScreen(Screen):
         baseline_map   = self._live_records_by_mac(self._live_baseline, focused)
         prev_map       = self._live_records_by_mac(self._live_prev,     focused)
         current_by_mac = self._live_records_by_mac(self._live_current,  focused)
-        for ap in self._live_ap_union(current_by_mac, focused):
-            self._add_live_ap_row(table, ap, current_by_mac, baseline_map, prev_map)
+        with self.app.batch_update():
+            for ap in self._live_ap_union(current_by_mac, focused):
+                self._add_live_ap_row(table, ap, current_by_mac, baseline_map, prev_map)
 
     def _refresh_live_event_table(self) -> None:
         table = self.query_one("#live-event-table", DataTable)
@@ -1705,15 +1964,22 @@ class MainScreen(Screen):
         events = [e for e in reversed(self._live_events)
                   if focused is None or e.wlc_name == focused]
         for evt in events:
-            from_txt = _fmt_state(evt.from_state) if evt.from_state != "—" \
-                       else Text("—", style="dim")
+            if evt.from_state.startswith("wlc:"):
+                from_txt = Text(evt.from_state[4:], style="dim yellow")
+                to_txt   = Text()
+                to_txt.append("⇄ ", style=_S_YELLOW)
+                to_txt.append(evt.to_state[4:], style=_S_YELLOW)
+            else:
+                from_txt = _fmt_state(evt.from_state) if evt.from_state != "—" \
+                           else Text("—", style="dim")
+                to_txt = _fmt_state(evt.to_state)
             table.add_row(
                 evt.timestamp.strftime("%H:%M:%S"),
                 str(evt.poll_num),
                 evt.wlc_name,
                 evt.ap_name,
                 from_txt,
-                _fmt_state(evt.to_state),
+                to_txt,
             )
 
     def _refresh_live_history_table(self) -> None:
@@ -1761,6 +2027,8 @@ class MainScreen(Screen):
 
         bas_txt, prev_txt, cur_txt = _live_ap_state_texts(ap, is_missing, baseline, prev)
         since = self._live_since_by_mac.get(ap.wtp_mac, "—")
+        _row_key = ap.wtp_mac or ap.name
+        self._ap_by_row_key[_row_key] = ap
 
         if self._live_show_mobility:
             moved_txt, bl_wlc_txt, cur_wlc_txt = _live_ap_mobility_texts(bl_wlc, cur_wlc, moved)
@@ -1768,13 +2036,19 @@ class MainScreen(Screen):
                 ap.name, ap.wtp_mac or "—",
                 bl_wlc_txt, cur_wlc_txt, moved_txt,
                 bas_txt, prev_txt, cur_txt, since,
-                key=ap.wtp_mac or ap.name,
+                key=_row_key,
             )
         else:
+            if moved:
+                wlc_txt = Text()
+                wlc_txt.append("⇄ ", style=_S_YELLOW)
+                wlc_txt.append(ap.wlc_name or "—", style=_S_YELLOW)
+            else:
+                wlc_txt = Text(ap.wlc_name or "—", style="default")
             table.add_row(
-                ap.name, ap.wtp_mac or "—", ap.wlc_name or "—",
+                ap.name, ap.wtp_mac or "—", wlc_txt,
                 bas_txt, prev_txt, cur_txt, since,
-                key=ap.wtp_mac or ap.name,
+                key=_row_key,
             )
 
     def _live_records_by_mac(
@@ -1862,12 +2136,12 @@ class MainScreen(Screen):
     # ------------------------------------------------------------------ helpers
 
     def _show_error(self, msg: str) -> None:
-        bar = self.query_one("#error-bar", Static)
+        bar = self.query_one(_WID_ERROR_BAR, Static)
         bar.update(f"  ✕  {msg}")
         bar.display = True
 
     def _hide_error(self) -> None:
-        self.query_one("#error-bar", Static).display = False
+        self.query_one(_WID_ERROR_BAR, Static).display = False
 
     def _set_status(self, msg: str) -> None:
         self.query_one("#loading-status", Label).update(msg)
@@ -1892,4 +2166,12 @@ class WLCCheckApp(App):
     def on_mount(self) -> None:
         self.username = os.environ.get("WLC_USER", "")
         self.password = os.environ.get("WLC_PASS", "")
+        inv_path = find_inventory()
+        if inv_path:
+            try:
+                dnac_entries = load_dnac_entries(inv_path)
+                if dnac_entries:
+                    set_dnac_host(dnac_entries[0].host)
+            except InventoryError:
+                pass
         self.push_screen(MainScreen())

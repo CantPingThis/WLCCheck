@@ -92,6 +92,10 @@ class WLCClient:
     # Public API
     # ------------------------------------------------------------------
 
+    def check_auth(self) -> None:
+        """Lightweight auth probe — raises WLCAuthError on 401/403, ignores response body."""
+        self._get(_HOSTNAME_PATH, timeout=10)
+
     def get_hostname(self) -> Optional[str]:
         try:
             resp = self._get(_HOSTNAME_PATH, timeout=10)
