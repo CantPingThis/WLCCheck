@@ -38,7 +38,7 @@ exclude_lines = [
     "if TYPE_CHECKING:",
 ]
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
