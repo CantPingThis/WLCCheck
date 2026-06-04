@@ -403,6 +403,39 @@ def _diff_wlans(
 # Client diff
 # ---------------------------------------------------------------------------
 
+def _classify_client_change(
+    mac: str, pre: ClientRecord, post: ClientRecord
+) -> Optional[ClientDiff]:
+    ip_lost        = pre.has_ip and not post.has_ip
+    ip_gained      = not pre.has_ip and post.has_ip
+    state_degraded = pre.state == "run" and post.state != "run"
+    if ip_lost:
+        return ClientDiff(
+            mac=mac, ap_name=post.ap_name, wlan_ssid=post.wlan_ssid,
+            wlc_name=post.wlc_name,
+            pre_state=pre.state, post_state=post.state,
+            pre_ipv4=pre.ipv4, post_ipv4=post.ipv4,
+            change_type="lost_ip", severity="critical",
+        )
+    if ip_gained:
+        return ClientDiff(
+            mac=mac, ap_name=post.ap_name, wlan_ssid=post.wlan_ssid,
+            wlc_name=post.wlc_name,
+            pre_state=pre.state, post_state=post.state,
+            pre_ipv4=pre.ipv4, post_ipv4=post.ipv4,
+            change_type="got_ip", severity="info",
+        )
+    if state_degraded:
+        return ClientDiff(
+            mac=mac, ap_name=post.ap_name, wlan_ssid=post.wlan_ssid,
+            wlc_name=post.wlc_name,
+            pre_state=pre.state, post_state=post.state,
+            pre_ipv4=pre.ipv4, post_ipv4=post.ipv4,
+            change_type="state_change", severity="warning",
+        )
+    return None
+
+
 def _diff_clients(
     pre_clients: List[ClientRecord],
     post_clients: List[ClientRecord],
@@ -417,38 +450,11 @@ def _diff_clients(
         post = post_map.get(mac)
 
         if pre and post:
-            ip_lost   = pre.has_ip  and not post.has_ip
-            ip_gained = not pre.has_ip and post.has_ip
-            state_degraded = pre.state == "run" and post.state != "run"
-
-            if ip_lost:
-                diffs.append(ClientDiff(
-                    mac=mac, ap_name=post.ap_name, wlan_ssid=post.wlan_ssid,
-                    wlc_name=post.wlc_name,
-                    pre_state=pre.state, post_state=post.state,
-                    pre_ipv4=pre.ipv4, post_ipv4=post.ipv4,
-                    change_type="lost_ip", severity="critical",
-                ))
-            elif ip_gained:
-                diffs.append(ClientDiff(
-                    mac=mac, ap_name=post.ap_name, wlan_ssid=post.wlan_ssid,
-                    wlc_name=post.wlc_name,
-                    pre_state=pre.state, post_state=post.state,
-                    pre_ipv4=pre.ipv4, post_ipv4=post.ipv4,
-                    change_type="got_ip", severity="info",
-                ))
-            elif state_degraded:
-                diffs.append(ClientDiff(
-                    mac=mac, ap_name=post.ap_name, wlan_ssid=post.wlan_ssid,
-                    wlc_name=post.wlc_name,
-                    pre_state=pre.state, post_state=post.state,
-                    pre_ipv4=pre.ipv4, post_ipv4=post.ipv4,
-                    change_type="state_change", severity="warning",
-                ))
+            diff = _classify_client_change(mac, pre, post)
+            if diff is not None:
+                diffs.append(diff)
         elif pre:
-            # Client disappeared — only flag if it had no IP (suspicious)
-            # Normal roaming/disconnect is expected, not worth flagging
-            pass
+            pass  # disappeared clients (normal roaming) are not flagged
         else:
             assert post is not None
             if not post.has_ip:
