@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import random
+import secrets
 import sqlite3
 import string
 from datetime import datetime, timedelta
@@ -29,7 +29,8 @@ _RETENTION_DAYS = 30
 
 
 def _short_id(n: int = 6) -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
 
 
 def _make_uuid(prefix: str) -> str:

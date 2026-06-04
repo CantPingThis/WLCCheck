@@ -220,41 +220,32 @@ def _diff_aps(
     post_by_name = {r.name: r for r in post_records if r.name and not r.wtp_mac}
 
     diffs: List[APDiff] = []
-
-    for mac in set(pre_by_mac) | set(post_by_mac):
-        pre  = pre_by_mac.get(mac)
-        post = post_by_mac.get(mac)
-        if pre and post:
-            if pre.state != post.state:
-                diffs.append(_ap_state_change(pre, post))
-            if pre.tags_key != post.tags_key:
-                diffs.append(_ap_tag_change(pre, post))
-            if pre.wlc_name and post.wlc_name and pre.wlc_name != post.wlc_name:
-                diffs.append(_ap_wlc_move(pre, post))
-        elif pre:
-            diffs.append(_ap_disappeared(pre))
-        else:
-            assert post is not None
-            diffs.append(_ap_new(post))
-
-    for name in set(pre_by_name) | set(post_by_name):
-        pre  = pre_by_name.get(name)
-        post = post_by_name.get(name)
-        if pre and post:
-            if pre.state != post.state:
-                diffs.append(_ap_state_change(pre, post))
-            if pre.tags_key != post.tags_key:
-                diffs.append(_ap_tag_change(pre, post))
-            if pre.wlc_name and post.wlc_name and pre.wlc_name != post.wlc_name:
-                diffs.append(_ap_wlc_move(pre, post))
-        elif pre:
-            diffs.append(_ap_disappeared(pre))
-        else:
-            assert post is not None
-            diffs.append(_ap_new(post))
-
+    _process_ap_pairs(pre_by_mac, post_by_mac, diffs)
+    _process_ap_pairs(pre_by_name, post_by_name, diffs)
     diffs.sort(key=lambda d: (_sev_rank(d.severity), d.name.lower()))
     return diffs
+
+
+def _process_ap_pairs(pre_map: dict, post_map: dict, diffs: List[APDiff]) -> None:
+    for key in set(pre_map) | set(post_map):
+        pre  = pre_map.get(key)
+        post = post_map.get(key)
+        if pre and post:
+            _process_ap_pair(pre, post, diffs)
+        elif pre:
+            diffs.append(_ap_disappeared(pre))
+        else:
+            assert post is not None
+            diffs.append(_ap_new(post))
+
+
+def _process_ap_pair(pre: APRecord, post: APRecord, diffs: List[APDiff]) -> None:
+    if pre.state != post.state:
+        diffs.append(_ap_state_change(pre, post))
+    if pre.tags_key != post.tags_key:
+        diffs.append(_ap_tag_change(pre, post))
+    if pre.wlc_name and post.wlc_name and pre.wlc_name != post.wlc_name:
+        diffs.append(_ap_wlc_move(pre, post))
 
 
 def _ap_state_change(pre: APRecord, post: APRecord) -> APDiff:
@@ -332,11 +323,30 @@ def _classify_ap(pre: str, post: str) -> tuple[str, str]:
 # WLAN diff
 # ---------------------------------------------------------------------------
 
+def _classify_wlan_state(pre_state: str, post_state: str) -> tuple[str, str]:
+    if pre_state == "up" and post_state == "down":
+        return "down", "critical"
+    if pre_state == "down" and post_state == "up":
+        return "up", "info"
+    return "state_change", "warning"
+
+
+def _classify_wlan_clients(pre_count: int, post_count: int) -> tuple[str, str]:
+    delta = post_count - pre_count
+    if post_count == 0 and pre_count > 0:
+        return "client_drop", "critical"
+    pct_drop = (pre_count - post_count) / pre_count * 100 if pre_count > 0 else 0
+    if pct_drop >= 50:
+        return "client_drop", "critical"
+    if pct_drop >= 20:
+        return "client_drop", "warning"
+    return ("client_gain" if delta > 0 else "client_drop"), "info"
+
+
 def _diff_wlans(
     pre_wlans: List[WLANRecord],
     post_wlans: List[WLANRecord],
 ) -> List[WLANDiff]:
-    # Key: (wlc_name, wlan_id)
     pre_map  = {(w.wlc_name, w.wlan_id): w for w in pre_wlans}
     post_map = {(w.wlc_name, w.wlan_id): w for w in post_wlans}
 
@@ -347,16 +357,8 @@ def _diff_wlans(
         post = post_map.get(key)
 
         if pre and post:
-            state_changed   = pre.state != post.state
-            clients_changed = pre.client_count != post.client_count
-
-            if state_changed:
-                if pre.state == "up" and post.state == "down":
-                    ct, sev = "down", "critical"
-                elif pre.state == "down" and post.state == "up":
-                    ct, sev = "up", "info"
-                else:
-                    ct, sev = "state_change", "warning"
+            if pre.state != post.state:
+                ct, sev = _classify_wlan_state(pre.state, post.state)
                 diffs.append(WLANDiff(
                     wlan_id=pre.wlan_id, profile_name=pre.profile_name,
                     ssid=pre.ssid, wlc_name=pre.wlc_name,
@@ -364,20 +366,8 @@ def _diff_wlans(
                     pre_clients=pre.client_count, post_clients=post.client_count,
                     change_type=ct, severity=sev,
                 ))
-            elif clients_changed:
-                delta = post.client_count - pre.client_count
-                if pre.client_count > 0:
-                    pct_drop = (pre.client_count - post.client_count) / pre.client_count * 100
-                else:
-                    pct_drop = 0
-                if post.client_count == 0 and pre.client_count > 0:
-                    ct, sev = "client_drop", "critical"
-                elif pct_drop >= 50:
-                    ct, sev = "client_drop", "critical"
-                elif pct_drop >= 20:
-                    ct, sev = "client_drop", "warning"
-                else:
-                    ct, sev = "client_gain" if delta > 0 else "client_drop", "info"
+            elif pre.client_count != post.client_count:
+                ct, sev = _classify_wlan_clients(pre.client_count, post.client_count)
                 diffs.append(WLANDiff(
                     wlan_id=pre.wlan_id, profile_name=pre.profile_name,
                     ssid=pre.ssid, wlc_name=pre.wlc_name,
@@ -429,15 +419,7 @@ def _diff_clients(
             ip_gained = not pre.has_ip and post.has_ip
             state_degraded = pre.state == "run" and post.state != "run"
 
-            if ip_lost and state_degraded:
-                diffs.append(ClientDiff(
-                    mac=mac, ap_name=post.ap_name, wlan_ssid=post.wlan_ssid,
-                    wlc_name=post.wlc_name,
-                    pre_state=pre.state, post_state=post.state,
-                    pre_ipv4=pre.ipv4, post_ipv4=post.ipv4,
-                    change_type="lost_ip", severity="critical",
-                ))
-            elif ip_lost:
+            if ip_lost:
                 diffs.append(ClientDiff(
                     mac=mac, ap_name=post.ap_name, wlan_ssid=post.wlan_ssid,
                     wlc_name=post.wlc_name,

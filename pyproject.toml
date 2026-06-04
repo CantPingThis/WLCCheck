@@ -24,3 +24,22 @@ include = ["wlccheck*"]
 
 [tool.setuptools.package-data]
 "wlccheck.tui" = ["*.tcss"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=wlccheck.core --cov-report=term-missing --cov-fail-under=80"
+
+[tool.coverage.run]
+omit = ["wlccheck/tui/*", "wlccheck/__main__.py", "wlccheck/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+]

@@ -8,7 +8,8 @@ from typing import Optional
 import requests
 import urllib3
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# DNAC/Catalyst Center typically uses self-signed certificates in enterprise deployments.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # NOSONAR python:S4830
 
 
 @dataclass
@@ -66,7 +67,7 @@ class DNACClient:
     _TOKEN_TTL    = 3540   # refresh token 1 minute before DNAC's 1-hour expiry
     _TOPOLOGY_TTL = 300    # cache full topology for 5 minutes
 
-    def __init__(self, host: str, username: str, password: str, verify_ssl: bool = False) -> None:
+    def __init__(self, host: str, username: str, password: str, verify_ssl: bool = False) -> None:  # NOSONAR python:S4830
         self._host   = host
         self._user   = username
         self._pass   = password
@@ -96,7 +97,7 @@ class DNACClient:
                 ip_addr=ip_addr,
                 hostname=device.get("hostname", ""),
             )
-        except Exception:
+        except Exception:  # NOSONAR python:S112 — any DNAC failure is non-fatal, returns None
             return None
 
     # ------------------------------------------------------------------

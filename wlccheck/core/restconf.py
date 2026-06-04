@@ -13,7 +13,9 @@ from .models import (
     normalize_state,
 )
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Cisco 9800 WLC uses self-signed certificates in most enterprise deployments.
+# SSL verification is intentionally disabled; caller controls verify_ssl flag.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # NOSONAR python:S4830
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +78,7 @@ class WLCClient:
         host: str,
         username: str,
         password: str,
-        verify_ssl: bool = False,
+        verify_ssl: bool = False,  # NOSONAR python:S4830 — enterprise WLC certs are self-signed
         timeout: int = 60,
     ) -> None:
         self.host = host.strip()
@@ -85,7 +87,7 @@ class WLCClient:
         self._base = f"https://{self.host}/restconf/data"
         self._session = requests.Session()
         self._session.auth = (username, password)
-        self._session.verify = verify_ssl
+        self._session.verify = verify_ssl  # NOSONAR python:S4830
         self._session.headers.update({"Accept": "application/yang-data+json"})
 
     # ------------------------------------------------------------------
@@ -100,7 +102,7 @@ class WLCClient:
         try:
             resp = self._get(_HOSTNAME_PATH, timeout=10)
             return resp.json().get("Cisco-IOS-XE-native:hostname")
-        except Exception:
+        except Exception:  # NOSONAR python:S112 — graceful degradation for optional hostname
             return None
 
     def get_ap_data(
@@ -114,7 +116,7 @@ class WLCClient:
             raise
         except WLCError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # NOSONAR python:S112 — wraps unknown requests errors into typed WLC exception
             raise WLCConnectionError(f"Request failed: {exc}") from exc
 
         raw_list = self._safe_list(resp)
@@ -140,7 +142,7 @@ class WLCClient:
         except WLCError as exc:
             self._notify(status_cb, f"[yellow]⚠[/yellow] AP tags skipped: {exc}")
             return {}
-        except Exception as exc:
+        except Exception as exc:  # NOSONAR python:S112 — optional feature, degrades gracefully
             self._notify(status_cb, f"[yellow]⚠[/yellow] AP tags failed: {exc}")
             return {}
 
@@ -166,7 +168,7 @@ class WLCClient:
                         status_cb,
                         f"[yellow]⚠[/yellow] AP tag response keys: {top_keys}",
                     )
-            except Exception:
+            except Exception:  # NOSONAR python:S112 — JSON parse fallback, failure is non-fatal
                 pass
 
         tags: Dict[str, tuple[str, str, str]] = {}
@@ -194,7 +196,7 @@ class WLCClient:
         except WLCError as exc:
             self._notify(status_cb, f"[yellow]⚠[/yellow] WLAN fetch skipped: {exc}")
             return []
-        except Exception as exc:
+        except Exception as exc:  # NOSONAR python:S112 — optional feature, degrades gracefully
             self._notify(status_cb, f"[yellow]⚠[/yellow] WLAN fetch failed: {exc}")
             return []
 
@@ -218,7 +220,7 @@ class WLCClient:
         except WLCError as exc:
             self._notify(status_cb, f"[yellow]⚠[/yellow] Client fetch skipped: {exc}")
             return []
-        except Exception as exc:
+        except Exception as exc:  # NOSONAR python:S112 — optional feature, degrades gracefully
             self._notify(status_cb, f"[yellow]⚠[/yellow] Client fetch failed: {exc}")
             return []
 
