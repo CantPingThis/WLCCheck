@@ -332,10 +332,12 @@ def _classify_wlan_state(pre_state: str, post_state: str) -> tuple[str, str]:
 
 
 def _classify_wlan_clients(pre_count: int, post_count: int) -> tuple[str, str]:
+    if pre_count == 0:
+        return "client_gain", "info"
     delta = post_count - pre_count
-    if post_count == 0 and pre_count > 0:
+    if post_count == 0:
         return "client_drop", "critical"
-    pct_drop = (pre_count - post_count) / pre_count * 100 if pre_count > 0 else 0
+    pct_drop = (pre_count - post_count) / pre_count * 100
     if pct_drop >= 50:
         return "client_drop", "critical"
     if pct_drop >= 20:

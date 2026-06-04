@@ -150,26 +150,8 @@ class WLCClient:
             "Cisco-IOS-XE-wireless-access-point-oper:ap-tag",
             "ap-tag",
         ))
-        # Fallback: nested under parent container
         if not raw_list and resp.status_code not in (204,) and resp.content.strip():
-            try:
-                body = resp.json()
-                container = (
-                    body.get("Cisco-IOS-XE-wireless-access-point-oper:access-point-oper-data")
-                    or body.get("access-point-oper-data")
-                )
-                if isinstance(container, dict):
-                    nested = container.get("ap-tag", [])
-                    if isinstance(nested, list):
-                        raw_list = nested
-                if not raw_list:
-                    top_keys = list(body.keys())[:5]
-                    self._notify(
-                        status_cb,
-                        f"[yellow]⚠[/yellow] AP tag response keys: {top_keys}",
-                    )
-            except Exception:  # NOSONAR python:S112 — JSON parse fallback, failure is non-fatal
-                pass
+            raw_list = self._extract_ap_tag_fallback(resp, status_cb)
 
         tags: Dict[str, tuple[str, str, str]] = {}
         for entry in raw_list:
@@ -267,6 +249,26 @@ class WLCClient:
     # ------------------------------------------------------------------
     # Private helpers — parsing
     # ------------------------------------------------------------------
+
+    def _extract_ap_tag_fallback(
+        self, resp: requests.Response, status_cb: Optional[StatusCallback]
+    ) -> list:
+        """Try nested container structure when direct ap-tag key is absent."""
+        try:
+            body = resp.json()
+        except ValueError:
+            return []
+        container = (
+            body.get("Cisco-IOS-XE-wireless-access-point-oper:access-point-oper-data")
+            or body.get("access-point-oper-data")
+        )
+        if isinstance(container, dict):
+            nested = container.get("ap-tag", [])
+            if isinstance(nested, list) and nested:
+                return nested
+        top_keys = list(body.keys())[:5]
+        self._notify(status_cb, f"[yellow]⚠[/yellow] AP tag response keys: {top_keys}")
+        return []
 
     @staticmethod
     def _norm_mac(mac: str) -> str:
