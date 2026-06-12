@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS ap_snapshots (
     policy_tag  TEXT DEFAULT '',
     site_tag    TEXT DEFAULT '',
     rf_tag      TEXT DEFAULT '',
+    eth_mac     TEXT DEFAULT '',
     FOREIGN KEY (run_uuid) REFERENCES runs(uuid)
 );
 
@@ -125,6 +126,8 @@ _MIGRATIONS = [
     "ALTER TABLE ap_snapshots ADD COLUMN rf_tag     TEXT DEFAULT ''",
     # v0.4 — has_clients flag on runs
     "ALTER TABLE runs ADD COLUMN has_clients INTEGER NOT NULL DEFAULT 0",
+    # v0.5 — ethernet MAC column
+    "ALTER TABLE ap_snapshots ADD COLUMN eth_mac TEXT DEFAULT ''",
 ]
 
 
@@ -178,13 +181,14 @@ class SnapshotDB:
                 conn.executemany(
                     """INSERT INTO ap_snapshots
                         (run_uuid, wlc_name, wtp_mac, name, raw_state, state,
-                         ip_addr, model, location, policy_tag, site_tag, rf_tag)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         ip_addr, model, location, policy_tag, site_tag, rf_tag,
+                         eth_mac)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     [
                         (
                             run_uuid, r.wlc_name, r.wtp_mac, r.name,
                             r.raw_state, r.state, r.ip_addr, r.model, r.location,
-                            r.policy_tag, r.site_tag, r.rf_tag,
+                            r.policy_tag, r.site_tag, r.rf_tag, r.eth_mac,
                         )
                         for r in result.records
                     ],
@@ -258,7 +262,7 @@ class SnapshotDB:
             rows = conn.execute(
                 """SELECT wlc_name, wtp_mac, name, raw_state, state,
                           ip_addr, model, location,
-                          policy_tag, site_tag, rf_tag
+                          policy_tag, site_tag, rf_tag, eth_mac
                    FROM ap_snapshots WHERE run_uuid = ? ORDER BY name""",
                 (run_uuid,),
             ).fetchall()
@@ -268,6 +272,7 @@ class SnapshotDB:
                 raw_state=r[3], state=r[4],
                 ip_addr=r[5], model=r[6], location=r[7],
                 policy_tag=r[8] or "", site_tag=r[9] or "", rf_tag=r[10] or "",
+                eth_mac=r[11] or "",
             )
             for r in rows
         ]

@@ -723,7 +723,10 @@ class APDetailModal(ModalScreen):
                 yield Label("WLC",      classes="ap-detail-key")
                 yield Label(ap.wlc_name  or "—", classes="ap-detail-val")
             with Horizontal(classes="ap-detail-row"):
-                yield Label("MAC",      classes="ap-detail-key")
+                yield Label("MAC Ethernet", classes="ap-detail-key")
+                yield Label(ap.eth_mac  or "—", classes="ap-detail-val")
+            with Horizontal(classes="ap-detail-row"):
+                yield Label("MAC WiFi",     classes="ap-detail-key")
                 yield Label(ap.wtp_mac  or "—", classes="ap-detail-val")
             with Horizontal(classes="ap-detail-row"):
                 yield Label("IP",       classes="ap-detail-key")

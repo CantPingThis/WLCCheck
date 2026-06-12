@@ -86,6 +86,7 @@ class APRecord:
     policy_tag: str = ""
     site_tag:   str = ""
     rf_tag:     str = ""
+    eth_mac:    str = ""
 
     @property
     def is_joined(self) -> bool:
