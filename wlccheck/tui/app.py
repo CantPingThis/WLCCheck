@@ -152,6 +152,7 @@ _COL_CHANGED_AT = "CHANGED AT"
 _COL_NOT_JOINED = "NOT JOINED"
 _COL_POLL_NUM   = "POLL #"
 _COL_PRE_STATE  = "PRE STATE"
+_COL_MAC_ETH    = "MAC ETH"
 _COL_POST_STATE = "POST STATE"
 
 _STATE_STYLE: dict[str, tuple[str, str]] = {
@@ -1106,7 +1107,7 @@ class MainScreen(Screen):
 
         with ap_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["NAME", "MAC", "WLC", "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT])
+            w.writerow(["NAME", _COL_MAC_ETH, "WLC", "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT])
             for ap in self._live_ap_union(current_by_mac, focused):
                 is_missing = ap.wtp_mac not in current_by_mac
                 baseline   = baseline_by_mac.get(ap.wtp_mac)
@@ -1114,7 +1115,7 @@ class MainScreen(Screen):
                 cur_state  = "Not Joined (gone)" if is_missing else _state_label(ap.state)
                 w.writerow([
                     ap.name,
-                    ap.wtp_mac or "—",
+                    ap.eth_mac or ap.wtp_mac or "—",
                     ap.wlc_name or "—",
                     _state_label(baseline.state) if baseline else "—",
                     _state_label(prev.state)     if prev     else "—",
@@ -1942,12 +1943,12 @@ class MainScreen(Screen):
             table.clear(columns=True)
             if self._live_show_mobility:
                 table.add_columns(
-                    "NAME", "MAC", "BL WLC", "CUR WLC", "MOVED",
+                    "NAME", _COL_MAC_ETH, "BL WLC", "CUR WLC", "MOVED",
                     "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT,
                 )
             else:
                 table.add_columns(
-                    "NAME", "MAC", "WLC", "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT,
+                    "NAME", _COL_MAC_ETH, "WLC", "BASELINE", _COL_PREV_POLL, "CURRENT", _COL_CHANGED_AT,
                 )
             self._live_ap_cols_mobility = self._live_show_mobility
         else:
@@ -2036,7 +2037,7 @@ class MainScreen(Screen):
         if self._live_show_mobility:
             moved_txt, bl_wlc_txt, cur_wlc_txt = _live_ap_mobility_texts(bl_wlc, cur_wlc, moved)
             table.add_row(
-                ap.name, ap.wtp_mac or "—",
+                ap.name, ap.eth_mac or ap.wtp_mac or "—",
                 bl_wlc_txt, cur_wlc_txt, moved_txt,
                 bas_txt, prev_txt, cur_txt, since,
                 key=_row_key,
@@ -2049,7 +2050,7 @@ class MainScreen(Screen):
             else:
                 wlc_txt = Text(ap.wlc_name or "—", style="default")
             table.add_row(
-                ap.name, ap.wtp_mac or "—", wlc_txt,
+                ap.name, ap.eth_mac or ap.wtp_mac or "—", wlc_txt,
                 bas_txt, prev_txt, cur_txt, since,
                 key=_row_key,
             )

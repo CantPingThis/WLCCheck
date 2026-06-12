@@ -346,7 +346,12 @@ class WLCClient:
 
         return APRecord(
             wtp_mac=entry.get("wtp-mac", ""),
-            eth_mac=entry.get("wtp-enet-mac", ""),
+            eth_mac=(
+                entry.get("device-detail", {})
+                      .get("static-info", {})
+                      .get("board-data", {})
+                      .get("wtp-enet-mac", "")
+            ),
             name=entry.get("name", ""),
             raw_state=str(raw_state),
             state=normalize_state(str(raw_state)),
