@@ -62,6 +62,7 @@ from ..core.models import (
 )
 from ..core.restconf import WLCAuthError, WLCClient
 from ..core.storage import SnapshotDB
+from .upgrade_screen import PredownloadScreen
 
 
 # ===========================================================================
@@ -107,6 +108,7 @@ class WLCCheckCommands(Provider):
         commands = [
             ("New Snapshot",          "c",  screen.action_snapshot),
             ("Post-Check",            "p",  screen.action_post_check),
+            ("EIU Upgrade",           "u",  screen.action_upgrade),
             ("Cycle Severity Filter", "f",  screen.action_filter_diff),
             ("Toggle Changed Only",   "o",  screen.action_toggle_unchanged),
             ("Filter: All",           None, lambda: screen._set_filter("all")),
@@ -153,6 +155,7 @@ _COL_NOT_JOINED = "NOT JOINED"
 _COL_POLL_NUM   = "POLL #"
 _COL_PRE_STATE  = "PRE STATE"
 _COL_MAC_ETH    = "MAC ETH"
+_CLS_COPYABLE   = "ap-detail-val copyable-val"
 _COL_POST_STATE = "POST STATE"
 
 _STATE_STYLE: dict[str, tuple[str, str]] = {
@@ -467,7 +470,7 @@ class RunOptionsModal(ModalScreen):
                 id="cb-live",
             )
             yield Label("Poll interval  (minimum 60 s)", classes="input-hint")
-            yield Select(self._INTERVALS, value=60, id="live-interval", allow_blank=False)
+            yield Select(self._INTERVALS, value=120, id="live-interval", allow_blank=False)
             with Horizontal(id="dialog-buttons"):
                 yield Button("Cancel",  classes="cancel-btn",  id="cancel-btn")
                 yield Button("Start →", classes="primary-btn", id="confirm-btn")
@@ -694,6 +697,23 @@ class RunPickerModal(ModalScreen):
 
 
 # ===========================================================================
+# Copyable label widget
+# ===========================================================================
+
+class CopyLabel(Label):
+    """Value label that copies its text to clipboard on click."""
+
+    def __init__(self, value: str, **kwargs) -> None:
+        super().__init__(value, **kwargs)
+        self._copy_value = value
+
+    def on_click(self) -> None:
+        if self._copy_value and self._copy_value != "—":
+            self.app.copy_to_clipboard(self._copy_value)
+            self.app.notify(f"Copié : {self._copy_value}", timeout=2)
+
+
+# ===========================================================================
 # AP Detail modal
 # ===========================================================================
 
@@ -725,13 +745,13 @@ class APDetailModal(ModalScreen):
                 yield Label(ap.wlc_name  or "—", classes="ap-detail-val")
             with Horizontal(classes="ap-detail-row"):
                 yield Label("MAC Ethernet", classes="ap-detail-key")
-                yield Label(ap.eth_mac  or "—", classes="ap-detail-val")
+                yield CopyLabel(ap.eth_mac  or "—", classes=_CLS_COPYABLE)
             with Horizontal(classes="ap-detail-row"):
                 yield Label("MAC WiFi",     classes="ap-detail-key")
-                yield Label(ap.wtp_mac  or "—", classes="ap-detail-val")
+                yield CopyLabel(ap.wtp_mac  or "—", classes=_CLS_COPYABLE)
             with Horizontal(classes="ap-detail-row"):
                 yield Label("IP",       classes="ap-detail-key")
-                yield Label(ap.ip_addr  or "—", classes="ap-detail-val")
+                yield CopyLabel(ap.ip_addr  or "—", classes=_CLS_COPYABLE)
             with Horizontal(classes="ap-detail-row"):
                 yield Label("Model",    classes="ap-detail-key")
                 yield Label(ap.model    or "—", classes="ap-detail-val")
@@ -816,6 +836,7 @@ class MainScreen(Screen):
         Binding("ctrl+p",    "command_palette",   "Commands"),
         Binding("c",         "snapshot",          "Snapshot"),
         Binding("p",         "post_check",        "Post-Check"),
+        Binding("u",         "upgrade",           "EIU Upgrade"),
         Binding("f",         "filter_diff",       "Sev. Filter"),
         Binding("o",         "toggle_unchanged",  "Only Changes"),
         Binding("space",     "live_pause",        "Pause/Resume", show=False),
@@ -1062,6 +1083,34 @@ class MainScreen(Screen):
             return
         self._collection_mode = "post_check"
         self.app.push_screen(RunPickerModal(runs), self._on_run_picked)
+
+    def action_upgrade(self) -> None:
+        self._hide_error()
+        inv_path = find_inventory()
+        if inv_path is None:
+            self._show_error("No inventory file found — EIU upgrade requires a WLC inventory.")
+            return
+        try:
+            entries = load_inventory(inv_path)
+        except InventoryError as exc:
+            self._show_error(str(exc))
+            return
+        self.app.push_screen(
+            WLCPickerModal(entries),
+            self._on_wlcs_chosen_for_upgrade,
+        )
+
+    def _on_wlcs_chosen_for_upgrade(self, chosen: Optional[List[WLCEntry]]) -> None:
+        if not chosen:
+            return
+        self._pending_entries = chosen
+        self._require_credentials(self._launch_upgrade_screen)
+
+    def _launch_upgrade_screen(self) -> None:
+        entries  = self._pending_entries or []
+        app: WLCCheckApp = self.app  # type: ignore[assignment]
+        self._pending_entries = None
+        self.app.push_screen(PredownloadScreen(entries, app.username, app.password, SnapshotDB()))
 
     def action_filter_diff(self) -> None:
         if self._current_diff is None:

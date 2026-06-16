@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 import string
@@ -17,6 +18,7 @@ from .models import (
     WLANRecord,
     WLCResult,
 )
+from .upgrade_models import APImageStatus, PredownloadPoll, PredownloadSession
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +117,35 @@ CREATE INDEX IF NOT EXISTS idx_snap_run    ON ap_snapshots(run_uuid);
 CREATE INDEX IF NOT EXISTS idx_wlan_run    ON wlan_snapshots(run_uuid);
 CREATE INDEX IF NOT EXISTS idx_client_run  ON client_snapshots(run_uuid);
 CREATE INDEX IF NOT EXISTS idx_rwlc_run    ON run_wlcs(run_uuid);
+
+CREATE TABLE IF NOT EXISTS upgrade_sessions (
+    uuid           TEXT PRIMARY KEY,
+    wlc_name       TEXT NOT NULL,
+    wlc_host       TEXT NOT NULL,
+    site_tags      TEXT NOT NULL DEFAULT '',
+    target_version TEXT NOT NULL DEFAULT '',
+    started_at     TEXT NOT NULL,
+    completed_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS upgrade_ap_logs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_uuid        TEXT    NOT NULL,
+    poll_num            INTEGER NOT NULL,
+    polled_at           TEXT    NOT NULL,
+    ap_name             TEXT    NOT NULL,
+    wlc_name            TEXT    NOT NULL DEFAULT '',
+    site_tag            TEXT    NOT NULL DEFAULT '',
+    current_version     TEXT    NOT NULL DEFAULT '',
+    backup_version      TEXT    NOT NULL DEFAULT '',
+    predownload_state   TEXT    NOT NULL DEFAULT 'unknown',
+    predownload_version TEXT    NOT NULL DEFAULT '',
+    img_pct             INTEGER NOT NULL DEFAULT 0,
+    method              TEXT    NOT NULL DEFAULT '',
+    FOREIGN KEY (session_uuid) REFERENCES upgrade_sessions(uuid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_upg_ap_session ON upgrade_ap_logs(session_uuid);
 """
 
 _MIGRATIONS = [
@@ -128,6 +159,7 @@ _MIGRATIONS = [
     "ALTER TABLE runs ADD COLUMN has_clients INTEGER NOT NULL DEFAULT 0",
     # v0.5 — ethernet MAC column
     "ALTER TABLE ap_snapshots ADD COLUMN eth_mac TEXT DEFAULT ''",
+    # v0.6 — upgrade_sessions + upgrade_ap_logs created via DDL above; no ALTER needed
 ]
 
 
@@ -357,6 +389,99 @@ class SnapshotDB:
                     total=r[6], joined=r[7], not_joined=r[8],
                     downloading=r[9], other=r[10],
                 ),
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Upgrade sessions
+    # ------------------------------------------------------------------
+
+    def save_upgrade_session(self, session: PredownloadSession) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO upgrade_sessions
+                   (uuid, wlc_name, wlc_host, site_tags, target_version,
+                    started_at, completed_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    session.uuid,
+                    session.wlc_name,
+                    session.wlc_host,
+                    json.dumps(session.site_tags),
+                    session.target_version,
+                    session.started_at.isoformat(timespec="seconds"),
+                    session.completed_at.isoformat(timespec="seconds") if session.completed_at else None,
+                ),
+            )
+
+    def save_upgrade_poll(self, session_uuid: str, poll: PredownloadPoll) -> None:
+        polled_at = poll.timestamp.isoformat(timespec="seconds")
+        rows = [
+            (
+                session_uuid,
+                poll.poll_num,
+                polled_at,
+                s.name,
+                s.wlc_name,
+                s.site_tag,
+                s.current_version,
+                s.backup_version,
+                s.predownload_state,
+                s.predownload_version,
+                s.img_pct,
+                s.method,
+            )
+            for s in poll.all_ap_statuses
+        ]
+        if rows:
+            with self._connect() as conn:
+                conn.executemany(
+                    """INSERT INTO upgrade_ap_logs
+                       (session_uuid, poll_num, polled_at, ap_name, wlc_name,
+                        site_tag, current_version, backup_version,
+                        predownload_state, predownload_version, img_pct, method)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    rows,
+                )
+
+    def get_upgrade_sessions(self, limit: int = 20) -> List[PredownloadSession]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT uuid, wlc_name, wlc_host, site_tags, target_version,
+                          started_at, completed_at
+                   FROM upgrade_sessions ORDER BY started_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        sessions = []
+        for uuid, wlc_name, wlc_host, site_tags_json, target_version, started_at, completed_at in rows:
+            sessions.append(PredownloadSession(
+                uuid=uuid,
+                wlc_name=wlc_name,
+                wlc_host=wlc_host,
+                site_tags=json.loads(site_tags_json or "[]"),
+                target_version=target_version or "",
+                started_at=datetime.fromisoformat(started_at),
+                completed_at=datetime.fromisoformat(completed_at) if completed_at else None,
+            ))
+        return sessions
+
+    def load_upgrade_ap_logs(self, session_uuid: str) -> List[APImageStatus]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT ap_name, wlc_name, site_tag, current_version, backup_version,
+                          predownload_state, predownload_version, img_pct, method
+                   FROM upgrade_ap_logs WHERE session_uuid = ?
+                   ORDER BY poll_num DESC, ap_name""",
+                (session_uuid,),
+            ).fetchall()
+        return [
+            APImageStatus(
+                name=r[0], wlc_name=r[1], site_tag=r[2],
+                wtp_mac="",
+                current_version=r[3], backup_version=r[4],
+                predownload_state=r[5], predownload_version=r[6],
+                img_pct=r[7], method=r[8],
             )
             for r in rows
         ]

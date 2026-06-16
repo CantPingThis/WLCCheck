@@ -807,6 +807,11 @@ APDetailModal {
     width: 1fr;
 }
 
+.copyable-val:hover {
+    color: $accent;
+    text-style: bold;
+}
+
 .ap-detail-placeholder {
     color: #484f58;
 }
